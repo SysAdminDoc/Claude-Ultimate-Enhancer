@@ -2,6 +2,23 @@
 
 All-in-one claude.ai userscript: theme engine, usage monitor, prompt library, auto-scroll, DOM trimmer, visual upgrades, settings panel.
 
+## Shipped
+
+### v1.1.0 (2026-05-28)
+- Catppuccin Mocha theme variant (part of the broader Catppuccin set — Macchiato / Frappé / Latte still pending)
+- `@updateURL` + `@downloadURL` metadata for auto-updates from this repo's `main` branch
+- `@inject-into content` for Tampermonkey MV3 sandbox compatibility
+- TrustedTypes `cue-html` policy wrapping every dynamic `innerHTML` site — survives `require-trusted-types-for 'script'` CSP
+- `@version` ↔ README badge ↔ CHANGELOG sync workflow established
+- `@homepageURL` + `@supportURL` metadata
+
+### v1.0.0 (initial)
+- Conversation export to Markdown (`Ctrl+Shift+E`)
+- Live SSE `message_limit` subscription for unrounded 5h / weekly usage bars
+- Burn-rate projection in the context tracker
+- Native Claude feature toggles (Code Execution / Repl Tool / Memory / Search / Projects)
+- Code-block extraction + clean copy across hljs / shiki / prism / generic markup
+
 ## Planned Features
 
 ### Usage / Tokens
@@ -21,7 +38,7 @@ All-in-one claude.ai userscript: theme engine, usage monitor, prompt library, au
 
 ### UI / Themes
 - **Shadow DOM** isolation for all injected UI (stop Claude CSS churn from breaking our styles)
-- **Catppuccin** (Mocha / Macchiato / Frappé / Latte) presets
+- ~~**Catppuccin** (Mocha / Macchiato / Frappé / Latte) presets~~ — Mocha shipped in v1.1.0; Macchiato / Frappé / Latte still pending
 - **Density modes** — Compact / Comfortable / Reading
 - **Side-panel pin** for settings + library (resize + persist)
 - **Message-tree sidebar** — jump between user/assistant turns in long conversations
@@ -36,12 +53,12 @@ All-in-one claude.ai userscript: theme engine, usage monitor, prompt library, au
 ### Settings / Plumbing
 - **Modular toggle bundle** — each feature lives in its own module, can be disabled without reload
 - **Config import/export** as JSON
-- **`@updateURL` + `@downloadURL`** so users get auto-updates
-- **Tampermonkey MV3** sandbox test pass (inject-into content gotchas)
-- **`@version` sync** with README badge + CHANGELOG on every release
+- ~~**`@updateURL` + `@downloadURL`** so users get auto-updates~~ — shipped v1.1.0
+- ~~**Tampermonkey MV3** sandbox test pass (inject-into content gotchas)~~ — `@inject-into content` shipped v1.1.0
+- ~~**`@version` sync** with README badge + CHANGELOG on every release~~ — shipped v1.1.0
 
 ### Reliability
-- `trustedTypes.createPolicy()` for all `innerHTML` so claude.ai's CSP never blocks us
+- ~~`trustedTypes.createPolicy()` for all `innerHTML` so claude.ai's CSP never blocks us~~ — shipped v1.1.0 (`cue-html` policy)
 - Graceful degradation when Claude renames DOM selectors — feature-flag modules independently
 - Error log panel (toggle via settings) — see which modules broke on the current page
 
