@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Claude Ultimate Enhancer
 // @namespace    https://github.com/SysAdminDoc/Claude-Ultimate-Enhancer
-// @version      1.1.0
-// @description  All-in-one Claude.ai enhancement suite - theme engine (Oceanic / Midnight / Catppuccin Mocha), usage monitor, prompt library, auto-scroll, DOM trimmer, visual upgrades, keyboard shortcuts, and more
+// @version      1.3.0
+// @description  All-in-one Claude.ai enhancement suite - theme engine, usage monitor, conversation search, prompt library, auto-scroll, DOM trimmer, code folding, visual upgrades, panel tools, and more
 // @author       SysAdminDoc
 // @homepageURL  https://github.com/SysAdminDoc/Claude-Ultimate-Enhancer
 // @supportURL   https://github.com/SysAdminDoc/Claude-Ultimate-Enhancer/issues
@@ -23,7 +23,7 @@
     if (window.__claudeUltimateLoaded) return;
     window.__claudeUltimateLoaded = true;
 
-    const VERSION = '1.1.0';
+    const VERSION = '1.3.0';
     const PREFIX = 'cue';
     const LOG_TAG = '[CUE]';
 
@@ -55,6 +55,8 @@
             // -- Layout --
             wideMode: true,
             chatWidthPct: 90,
+            densityMode: 'comfortable', // comfortable | compact | reading
+            focusMode: false,           // hide sidebar for deep work
             // -- Visual --
             coloredButtons: true,
             coloredBoldItalic: true,
@@ -62,6 +64,7 @@
             customScrollbar: true,
             // -- Usage Monitor --
             usageMonitor: true,
+            usagePlan: 'pro',          // pro | max5 | max20
             usageFetchInterval: 300,   // seconds between API polls
             // -- Feature Toggles --
             featureToggles: true,
@@ -76,19 +79,29 @@
             contextWindow: 200000,
             warnThreshold: 0.55,
             criticalThreshold: 0.75,
+            // -- Code Fold --
+            codeFold: true,
+            // -- Copy Turn --
+            copyTurn: true,
+            // -- Snippet Trigger --
+            snippetTrigger: true,
+            // -- Conversation Tools --
+            conversationSearch: true,
+            forkConversation: true,
+            voiceDictation: true,
             // -- Prompt Library --
             promptLibrary: true,
             // -- Response Monitor --
             responseMonitor: true,
             notifySound: true,
             notifyFlash: true,
-            // -- Keyboard Shortcuts --
-            shortcuts: true,
             // -- Paste Fix --
             pasteFix: true,
             // -- Panel --
             panelPosition: 'bottom-right',
             panelCollapsed: true,
+            panelPinned: false,
+            panelWidth: 320,
         },
         get(key) {
             if (key in this._cache) return this._cache[key];
@@ -238,23 +251,64 @@
         },
         getLastResponse() {
             const groups = document.querySelectorAll(SEL.msgGroup);
-            for (let i = groups.length - 1; i >= 0; i--) { if (!groups[i].querySelector(SEL.userMsg)) return groups[i].innerText.trim(); }
+            for (let i = groups.length - 1; i >= 0; i--) { if (!groups[i].querySelector(SEL.userMsg)) return getCleanElementText(groups[i]); }
             return '';
         },
     };
+
+    function getCleanElementText(el) {
+        if (!el) return '';
+        const clone = el.cloneNode(true);
+        clone.querySelectorAll('[class^="' + PREFIX + '-"], [class*=" ' + PREFIX + '-"]').forEach(node => node.remove());
+        return (clone.innerText || clone.textContent || '').trim();
+    }
+
+    function getConversationMessages(maxIndex = null) {
+        const main = document.querySelector('main');
+        if (!main) return [];
+        const groups = $$(SEL.msgGroup, main);
+        const last = maxIndex === null ? groups.length - 1 : Math.min(maxIndex, groups.length - 1);
+        const messages = [];
+        for (let i = 0; i <= last; i++) {
+            const group = groups[i];
+            const text = getCleanElementText(group);
+            if (!text) continue;
+            messages.push({
+                index: i,
+                role: group.querySelector(SEL.userMsg) ? 'human' : 'assistant',
+                text,
+                html: group.innerHTML
+            });
+        }
+        return messages;
+    }
+
+    function getCurrentConversationId() {
+        const match = location.pathname.match(/\/chat\/([a-f0-9-]+)/i);
+        return match ? match[1] : null;
+    }
 
     // =====================================================================
     //  CLAUDE API HELPERS
     // =====================================================================
     const ClaudeAPI = {
+        _orgId: null,
+
         async getOrgs() {
             const r = await fetch('/api/organizations', { credentials: 'include' });
-            return r.json();
+            const data = await r.json();
+            if (Array.isArray(data)) return data;
+            return data.organizations || data.data || [];
+        },
+        async getOrgId() {
+            if (this._orgId) return this._orgId;
+            const orgs = await this.getOrgs();
+            this._orgId = orgs[0]?.uuid || orgs[0]?.id || null;
+            return this._orgId;
         },
         async getUsage() {
             try {
-                const orgs = await this.getOrgs();
-                const orgId = orgs[0]?.uuid;
+                const orgId = await this.getOrgId();
                 if (!orgId) return null;
                 const r = await fetch(`/api/organizations/${orgId}/usage`, { credentials: 'include' });
                 return r.json();
@@ -279,6 +333,43 @@
                 });
                 return r.ok ? await r.json() : null;
             } catch (e) { return null; }
+        },
+        _extractConversationArray(data) {
+            if (Array.isArray(data)) return data;
+            return data?.chat_conversations || data?.conversations || data?.items || data?.data || [];
+        },
+        async listConversations(limit = 200) {
+            try {
+                const orgId = await this.getOrgId();
+                if (!orgId) return [];
+                const out = [];
+                let cursor = null;
+                let offset = 0;
+                for (let page = 0; page < 8 && out.length < limit; page++) {
+                    const pageLimit = Math.min(100, limit - out.length);
+                    const query = cursor
+                        ? `limit=${pageLimit}&cursor=${encodeURIComponent(cursor)}`
+                        : `limit=${pageLimit}&offset=${offset}`;
+                    const r = await fetch(`/api/organizations/${orgId}/chat_conversations?${query}`, { credentials: 'include' });
+                    if (!r.ok) break;
+                    const data = await r.json();
+                    const items = this._extractConversationArray(data);
+                    if (!items.length) break;
+                    out.push(...items);
+                    cursor = data.next_cursor || data.nextCursor || data.cursor || null;
+                    offset += items.length;
+                    if (!cursor && data.has_more !== true && data.hasMore !== true) break;
+                }
+                return out;
+            } catch (e) { return []; }
+        },
+        async getConversation(id) {
+            try {
+                const orgId = await this.getOrgId();
+                if (!orgId || !id) return null;
+                const r = await fetch(`/api/organizations/${orgId}/chat_conversations/${id}`, { credentials: 'include' });
+                return r.ok ? await r.json() : null;
+            } catch (e) { return null; }
         }
     };
 
@@ -296,6 +387,15 @@
             const origFetch = window.fetch;
             const self = this;
             window.fetch = async function (...args) {
+                try {
+                    const request = args[0];
+                    const init = args[1] || {};
+                    const url = typeof request === 'string' ? request : request?.url || '';
+                    const method = (init.method || request?.method || 'GET').toUpperCase();
+                    if (method === 'POST' && (url.includes('/completion') || url.includes('/chat_conversations'))) {
+                        EventBus.emit('usage:sent', { time: Date.now(), url });
+                    }
+                } catch (e) { /* never break app */ }
                 const response = await origFetch.apply(this, args);
                 try {
                     const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
@@ -429,6 +529,76 @@
                     --accent-secondary-000: 23 92% 75%; --accent-secondary-100: 23 92% 65%;
                     --oncolor-100: 240 21% 15%; --oncolor-200: 240 21% 15%; --oncolor-300: 240 21% 15%;
                 `
+            },
+            // Catppuccin Macchiato — base=#24273a, mantle=#1e2030, crust=#181926,
+            // text=#cad3f5, subtext0=#a5adcb, mauve=#c6a0f6 (accent), red=#ed8796, green=#a6da95
+            macchiato: {
+                name: 'Catppuccin Macchiato',
+                vars: `
+                    --accent-main-000: 267 83% 80%; --accent-main-100: 267 83% 80%;
+                    --accent-main-200: 267 83% 74%; --accent-main-900: 232 23% 18%;
+                    --bg-000: 232 23% 18%; --bg-100: 233 24% 15%; --bg-200: 233 30% 11%;
+                    --bg-300: var(--bg-000); --bg-400: var(--bg-000); --bg-500: 233 30% 11%;
+                    --text-000: 227 68% 88%; --text-100: 227 68% 88%;
+                    --text-200: 228 20% 73%; --text-300: 228 20% 73%;
+                    --text-400: 228 15% 65%; --text-500: 228 15% 65%;
+                    --border-100: 231 16% 34%; --border-200: 231 16% 34%;
+                    --border-300: 231 16% 34%; --border-400: 231 16% 34%;
+                    --danger-000: 351 74% 73%; --danger-100: 351 74% 66%;
+                    --danger-200: 351 74% 66%; --danger-900: 351 50% 25%;
+                    --success-000: 105 48% 72%; --success-100: 105 48% 64%;
+                    --success-200: 105 48% 64%; --success-900: 105 40% 20%;
+                    --accent-pro-000: 40 70% 78%; --accent-pro-100: 40 70% 65%;
+                    --accent-secondary-000: 21 86% 73%; --accent-secondary-100: 21 86% 63%;
+                    --oncolor-100: 232 23% 18%; --oncolor-200: 232 23% 18%; --oncolor-300: 232 23% 18%;
+                `
+            },
+            // Catppuccin Frappe — base=#303446, mantle=#292c3c, crust=#232634,
+            // text=#c6d0f5, subtext0=#a5adce, mauve=#ca9ee6 (accent), red=#e78284, green=#a6d189
+            frappe: {
+                name: 'Catppuccin Frappé',
+                vars: `
+                    --accent-main-000: 277 59% 76%; --accent-main-100: 277 59% 76%;
+                    --accent-main-200: 277 59% 70%; --accent-main-900: 229 19% 23%;
+                    --bg-000: 229 19% 23%; --bg-100: 231 19% 20%; --bg-200: 231 20% 17%;
+                    --bg-300: var(--bg-000); --bg-400: var(--bg-000); --bg-500: 231 20% 17%;
+                    --text-000: 227 70% 87%; --text-100: 227 70% 87%;
+                    --text-200: 228 17% 73%; --text-300: 228 17% 73%;
+                    --text-400: 228 13% 65%; --text-500: 228 13% 65%;
+                    --border-100: 230 13% 38%; --border-200: 230 13% 38%;
+                    --border-300: 230 13% 38%; --border-400: 230 13% 38%;
+                    --danger-000: 359 68% 71%; --danger-100: 359 68% 64%;
+                    --danger-200: 359 68% 64%; --danger-900: 359 50% 25%;
+                    --success-000: 96 44% 68%; --success-100: 96 44% 60%;
+                    --success-200: 96 44% 60%; --success-900: 96 40% 20%;
+                    --accent-pro-000: 40 62% 73%; --accent-pro-100: 40 62% 60%;
+                    --accent-secondary-000: 20 79% 70%; --accent-secondary-100: 20 79% 60%;
+                    --oncolor-100: 229 19% 23%; --oncolor-200: 229 19% 23%; --oncolor-300: 229 19% 23%;
+                `
+            },
+            // Catppuccin Latte (LIGHT theme) — base=#eff1f5, mantle=#e6e9ef, crust=#dce0e8,
+            // text=#4c4f69, subtext0=#6c6f85, mauve=#8839ef (accent), red=#d20f39, green=#40a02b
+            latte: {
+                name: 'Catppuccin Latte',
+                light: true,
+                vars: `
+                    --accent-main-000: 266 85% 58%; --accent-main-100: 266 85% 58%;
+                    --accent-main-200: 266 85% 50%; --accent-main-900: 220 23% 95%;
+                    --bg-000: 220 23% 95%; --bg-100: 227 16% 92%; --bg-200: 223 16% 88%;
+                    --bg-300: var(--bg-000); --bg-400: var(--bg-000); --bg-500: 223 16% 88%;
+                    --text-000: 234 16% 35%; --text-100: 234 16% 35%;
+                    --text-200: 233 10% 47%; --text-300: 233 10% 47%;
+                    --text-400: 233 10% 55%; --text-500: 233 10% 55%;
+                    --border-100: 225 14% 77%; --border-200: 225 14% 77%;
+                    --border-300: 225 14% 77%; --border-400: 225 14% 77%;
+                    --danger-000: 347 87% 44%; --danger-100: 347 87% 38%;
+                    --danger-200: 347 87% 38%; --danger-900: 347 60% 85%;
+                    --success-000: 109 58% 40%; --success-100: 109 58% 34%;
+                    --success-200: 109 58% 34%; --success-900: 109 40% 85%;
+                    --accent-pro-000: 35 77% 49%; --accent-pro-100: 35 77% 42%;
+                    --accent-secondary-000: 22 99% 52%; --accent-secondary-100: 22 99% 45%;
+                    --oncolor-100: 220 23% 95%; --oncolor-200: 227 16% 92%; --oncolor-300: 227 16% 92%;
+                `
             }
         },
 
@@ -449,8 +619,11 @@
             const fontCSS = Settings.get('fontOverride') ? `
                 :root { --font-anthropic-serif: var(--font-anthropic-sans) !important; --font-ui-serif: var(--font-ui) !important; }
             ` : '';
+            const modeSelector = theme.light
+                ? '[data-theme=claude][data-mode=light]'
+                : '[data-theme=claude][data-mode=dark]';
             injectCSS(PREFIX + '-theme', `
-                [data-theme=claude][data-mode=dark] { ${theme.vars} }
+                ${modeSelector} { ${theme.vars} }
                 ${fontCSS}
                 * { scrollbar-color: hsla(var(--bg-300, 240 8% 11.4%)/50%) transparent !important; }
                 *, *:after, *:before { --tw-gradient-from-position: none !important; }
@@ -458,6 +631,76 @@
         },
 
         destroy() { removeCSS(PREFIX + '-theme'); }
+    };
+
+    // =====================================================================
+    //  MODULE: FOCUS MODE (anti-distraction)
+    // =====================================================================
+    const FocusModule = {
+        id: 'focusMode',
+
+        init() {
+            this._apply();
+            EventBus.on('setting:focusMode', () => this._apply());
+        },
+
+        _apply() {
+            if (!Settings.get('focusMode')) { removeCSS(PREFIX + '-focus'); return; }
+            injectCSS(PREFIX + '-focus', `
+                /* Hide the sidebar/navigation */
+                nav, [class*="sidebar"], [class*="side-navigation"] { display: none !important; }
+                /* Expand main content area */
+                main { margin-left: 0 !important; }
+                [class*="has-sidebar"] { grid-template-columns: 1fr !important; }
+            `);
+        },
+
+        destroy() { removeCSS(PREFIX + '-focus'); }
+    };
+
+    // =====================================================================
+    //  MODULE: DENSITY
+    // =====================================================================
+    const DensityModule = {
+        id: 'density',
+
+        MODES: {
+            comfortable: { name: 'Comfortable', css: '' }, // default — no overrides
+            compact: {
+                name: 'Compact',
+                css: `
+                    .font-claude-message, [class*="prose"] { font-size: 14px !important; line-height: 1.45 !important; }
+                    .group, [data-testid="user-message"] { padding-top: 4px !important; padding-bottom: 4px !important; }
+                    h1 { font-size: 1.3em !important; } h2 { font-size: 1.15em !important; } h3 { font-size: 1.05em !important; }
+                    pre { padding: 8px !important; margin: 6px 0 !important; }
+                    ul, ol { margin: 4px 0 !important; }
+                    p { margin: 4px 0 !important; }
+                `
+            },
+            reading: {
+                name: 'Reading',
+                css: `
+                    .font-claude-message, [class*="prose"] { font-size: 17px !important; line-height: 1.8 !important; letter-spacing: 0.01em !important; }
+                    .group, [data-testid="user-message"] { padding-top: 16px !important; padding-bottom: 16px !important; }
+                    p { margin: 12px 0 !important; }
+                    pre { padding: 16px !important; margin: 16px 0 !important; font-size: 15px !important; }
+                `
+            }
+        },
+
+        init() {
+            this._apply();
+            EventBus.on('setting:densityMode', () => this._apply());
+        },
+
+        _apply() {
+            const mode = Settings.get('densityMode');
+            const m = this.MODES[mode];
+            if (!m || !m.css) { removeCSS(PREFIX + '-density'); return; }
+            injectCSS(PREFIX + '-density', m.css);
+        },
+
+        destroy() { removeCSS(PREFIX + '-density'); }
     };
 
     // =====================================================================
@@ -715,6 +958,56 @@
     };
 
     // =====================================================================
+    //  MODULE: USAGE TRACKER (local rolling send counters)
+    // =====================================================================
+    const UsageTrackerModule = {
+        id: 'usageTracker',
+        STORAGE_KEY: PREFIX + '_usage_events',
+        _events: [],
+        _sessionStart: Date.now(),
+
+        init() {
+            this._load();
+            EventBus.on('usage:sent', (d) => this.record(d?.time || Date.now()));
+        },
+
+        _load() {
+            try {
+                const saved = GM_getValue(this.STORAGE_KEY, '[]');
+                this._events = JSON.parse(saved).filter(t => Number.isFinite(t));
+            } catch (e) { this._events = []; }
+            this._prune();
+        },
+
+        _save() { GM_setValue(this.STORAGE_KEY, JSON.stringify(this._events)); },
+
+        _prune() {
+            const cutoff = Date.now() - (8 * 24 * 60 * 60 * 1000);
+            this._events = this._events.filter(t => t >= cutoff);
+        },
+
+        record(time) {
+            this._events.push(time);
+            this._prune();
+            this._save();
+            EventBus.emit('usage:localUpdated', this.getStats());
+        },
+
+        getStats() {
+            const now = Date.now();
+            const within = ms => this._events.filter(t => now - t <= ms).length;
+            return {
+                session: this._events.filter(t => t >= this._sessionStart).length,
+                fiveHour: within(5 * 60 * 60 * 1000),
+                sevenDay: within(7 * 24 * 60 * 60 * 1000),
+                totalCached: this._events.length
+            };
+        },
+
+        destroy() {}
+    };
+
+    // =====================================================================
     //  MODULE: CONTEXT TRACKER
     // =====================================================================
     const ContextModule = {
@@ -812,6 +1105,111 @@
         },
 
         destroy() { clearInterval(this._interval); }
+    };
+
+    // =====================================================================
+    //  MODULE: CACHE INDICATOR
+    // =====================================================================
+    const CacheModule = {
+        id: 'cacheIndicator',
+        _timerInterval: null,
+        lastCacheHit: false,
+        lastCacheTime: null,
+        CACHE_TTL: 300, // 5 minutes default TTL for prompt caching
+
+        init() {
+            EventBus.on('stream:usage', (u) => {
+                const cacheRead = u.cache_read_input_tokens || 0;
+                if (cacheRead > 0) {
+                    this.lastCacheHit = true;
+                    this.lastCacheTime = Date.now();
+                    EventBus.emit('cache:hit', { tokens: cacheRead });
+                    this._startCountdown();
+                } else {
+                    this.lastCacheHit = false;
+                    EventBus.emit('cache:miss');
+                }
+            });
+            EventBus.on('navigation', () => {
+                this.lastCacheHit = false;
+                this.lastCacheTime = null;
+                this._stopCountdown();
+            });
+        },
+
+        _startCountdown() {
+            this._stopCountdown();
+            this._timerInterval = setInterval(() => {
+                if (!this.lastCacheTime) { this._stopCountdown(); return; }
+                const elapsed = (Date.now() - this.lastCacheTime) / 1000;
+                const remaining = Math.max(0, this.CACHE_TTL - elapsed);
+                EventBus.emit('cache:timer', { remaining, total: this.CACHE_TTL });
+                if (remaining <= 0) {
+                    this.lastCacheHit = false;
+                    this.lastCacheTime = null;
+                    EventBus.emit('cache:expired');
+                    this._stopCountdown();
+                }
+            }, 1000);
+        },
+
+        _stopCountdown() {
+            if (this._timerInterval) { clearInterval(this._timerInterval); this._timerInterval = null; }
+        },
+
+        destroy() { this._stopCountdown(); }
+    };
+
+    // =====================================================================
+    //  MODULE: COST ESTIMATOR
+    // =====================================================================
+    const CostModule = {
+        id: 'costEstimate',
+        // Pricing per million tokens (as of mid-2026)
+        PRICING: {
+            'opus':   { input: 15.00, output: 75.00, cache_read: 1.50, cache_write: 18.75 },
+            'sonnet': { input: 3.00,  output: 15.00, cache_read: 0.30, cache_write: 3.75 },
+            'haiku':  { input: 0.80,  output: 4.00,  cache_read: 0.08, cache_write: 1.00 },
+        },
+        sessionCost: 0,
+        lastModel: 'sonnet',
+        messageCosts: [],
+
+        init() {
+            EventBus.on('stream:usage', (u) => this._calcCost(u));
+            EventBus.on('stream:start', (d) => {
+                // Try to detect model from stream data
+                if (d.message?.model) {
+                    const m = d.message.model.toLowerCase();
+                    if (m.includes('opus')) this.lastModel = 'opus';
+                    else if (m.includes('haiku')) this.lastModel = 'haiku';
+                    else this.lastModel = 'sonnet';
+                }
+            });
+            EventBus.on('navigation', () => { this.sessionCost = 0; this.messageCosts = []; });
+        },
+
+        _calcCost(usage) {
+            const pricing = this.PRICING[this.lastModel] || this.PRICING.sonnet;
+            const inputTokens = usage.input_tokens || 0;
+            const outputTokens = usage.output_tokens || 0;
+            const cacheRead = usage.cache_read_input_tokens || 0;
+            const cacheWrite = usage.cache_creation_input_tokens || 0;
+
+            const cost = (inputTokens * pricing.input / 1e6) +
+                         (outputTokens * pricing.output / 1e6) +
+                         (cacheRead * pricing.cache_read / 1e6) +
+                         (cacheWrite * pricing.cache_write / 1e6);
+
+            this.sessionCost += cost;
+            this.messageCosts.push({ time: Date.now(), cost, model: this.lastModel });
+            EventBus.emit('cost:updated', { messageCost: cost, sessionCost: this.sessionCost, model: this.lastModel });
+        },
+
+        getSessionCost() { return this.sessionCost; },
+        getLastModel() { return this.lastModel; },
+
+        destroy() {}
     };
 
     // =====================================================================
@@ -999,6 +1397,648 @@
     };
 
     // =====================================================================
+    //  MODULE: CODE FOLD
+    // =====================================================================
+    const CodeFoldModule = {
+        id: 'codeFold',
+        _observer: null,
+        FOLD_THRESHOLD: 15, // lines before folding kicks in
+        VISIBLE_LINES: 6,   // lines to show when folded
+
+        init() {
+            this._applyStyles();
+            this._start();
+            EventBus.on('setting:codeFold', (v) => { if (v) this._start(); else this._stop(); });
+        },
+
+        _applyStyles() {
+            injectCSS(PREFIX + '-codefold', `
+                .${PREFIX}-fold-container { position: relative; }
+                .${PREFIX}-fold-container.folded pre { max-height: none; }
+                .${PREFIX}-fold-container.folded .${PREFIX}-fold-code { display: none; }
+                .${PREFIX}-fold-container.folded .${PREFIX}-fold-preview { display: block; }
+                .${PREFIX}-fold-container:not(.folded) .${PREFIX}-fold-code { display: block; }
+                .${PREFIX}-fold-container:not(.folded) .${PREFIX}-fold-preview { display: none; }
+                .${PREFIX}-fold-toggle {
+                    display: block; width: 100%; padding: 4px 12px; margin: 0;
+                    background: rgba(88,166,255,0.06); border: none; border-top: 1px solid rgba(88,166,255,0.15);
+                    color: #58a6ff; font-size: 11px; font-family: monospace; cursor: pointer;
+                    text-align: left; transition: background 0.2s;
+                }
+                .${PREFIX}-fold-toggle:hover { background: rgba(88,166,255,0.12); }
+                .${PREFIX}-fold-preview { white-space: pre; overflow: hidden; }
+            `);
+        },
+
+        _start() {
+            if (!Settings.get('codeFold')) return;
+            // Process existing code blocks
+            this._processAll();
+            // Observe for new ones
+            if (this._observer) this._observer.disconnect();
+            let timer;
+            this._observer = new MutationObserver(() => {
+                if (!Settings.get('codeFold')) return;
+                clearTimeout(timer);
+                timer = setTimeout(() => this._processAll(), 500);
+            });
+            this._observer.observe(document.querySelector('main') || document.body, { childList: true, subtree: true });
+        },
+
+        _stop() {
+            if (this._observer) this._observer.disconnect();
+            // Unfold all
+            $$('.' + PREFIX + '-fold-container').forEach(c => {
+                c.classList.remove('folded');
+                const toggle = c.querySelector('.' + PREFIX + '-fold-toggle');
+                if (toggle) toggle.remove();
+                const preview = c.querySelector('.' + PREFIX + '-fold-preview');
+                if (preview) preview.remove();
+                c.classList.remove(PREFIX + '-fold-container');
+            });
+        },
+
+        _processAll() {
+            $$('pre').forEach(pre => {
+                if (pre.closest('#' + PREFIX + '-panel')) return;
+                if (pre.dataset.cueFolded) return;
+                const code = pre.querySelector('code') || pre;
+                const text = code.innerText || code.textContent || '';
+                const lines = text.split('\n');
+                if (lines.length <= this.FOLD_THRESHOLD) return;
+                pre.dataset.cueFolded = '1';
+
+                // Wrap in container
+                const container = document.createElement('div');
+                container.className = PREFIX + '-fold-container folded';
+                pre.parentNode.insertBefore(container, pre);
+
+                // Move pre into container as the full code
+                pre.classList.add(PREFIX + '-fold-code');
+                container.appendChild(pre);
+
+                // Create preview (first N lines)
+                const previewEl = document.createElement('pre');
+                previewEl.className = PREFIX + '-fold-preview';
+                const previewCode = document.createElement('code');
+                // Copy class from original code element for syntax highlighting
+                if (code.className) previewCode.className = code.className;
+                previewCode.textContent = lines.slice(0, this.VISIBLE_LINES).join('\n');
+                previewEl.appendChild(previewCode);
+                container.insertBefore(previewEl, pre);
+
+                // Add toggle button
+                const hidden = lines.length - this.VISIBLE_LINES;
+                const toggle = document.createElement('button');
+                toggle.className = PREFIX + '-fold-toggle';
+                toggle.textContent = `[+${hidden} lines] Click to expand`;
+                toggle.addEventListener('click', () => {
+                    const isFolded = container.classList.contains('folded');
+                    container.classList.toggle('folded');
+                    toggle.textContent = isFolded
+                        ? `[-${hidden} lines] Click to collapse`
+                        : `[+${hidden} lines] Click to expand`;
+                });
+                container.appendChild(toggle);
+            });
+        },
+
+        destroy() {
+            this._stop();
+            removeCSS(PREFIX + '-codefold');
+        }
+    };
+
+    // =====================================================================
+    //  MODULE: COPY TURN
+    // =====================================================================
+    const CopyTurnModule = {
+        id: 'copyTurn',
+        _observer: null,
+
+        init() {
+            this._applyStyles();
+            this._start();
+            EventBus.on('setting:copyTurn', (v) => { if (v) this._start(); else this._stop(); });
+        },
+
+        _applyStyles() {
+            injectCSS(PREFIX + '-copyturn', `
+                .${PREFIX}-copy-turn-btn {
+                    position: absolute; top: 4px; right: 4px;
+                    background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1);
+                    color: #888; font-size: 10px; padding: 2px 6px; border-radius: 4px;
+                    cursor: pointer; opacity: 0; transition: opacity 0.2s, background 0.2s;
+                    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+                    z-index: 10;
+                }
+                .group:hover .${PREFIX}-copy-turn-btn,
+                [data-testid="user-message"]:hover ~ .${PREFIX}-copy-turn-btn,
+                .${PREFIX}-copy-turn-btn:hover { opacity: 1; }
+                .${PREFIX}-copy-turn-btn:hover { background: rgba(88,166,255,0.15); color: #58a6ff; }
+                .${PREFIX}-copy-turn-btn.copied { color: #3fb950; border-color: rgba(63,185,80,0.3); }
+            `);
+        },
+
+        _start() {
+            if (!Settings.get('copyTurn')) return;
+            this._processAll();
+            if (this._observer) this._observer.disconnect();
+            let timer;
+            this._observer = new MutationObserver(() => {
+                if (!Settings.get('copyTurn')) return;
+                clearTimeout(timer);
+                timer = setTimeout(() => this._processAll(), 500);
+            });
+            this._observer.observe(document.querySelector('main') || document.body, { childList: true, subtree: true });
+        },
+
+        _stop() {
+            if (this._observer) this._observer.disconnect();
+            $$('.' + PREFIX + '-copy-turn-btn').forEach(b => b.remove());
+        },
+
+        _processAll() {
+            const main = document.querySelector('main');
+            if (!main) return;
+            $$(SEL.msgGroup, main).forEach(group => {
+                if (group.querySelector('.' + PREFIX + '-copy-turn-btn')) return;
+                // Ensure the group has relative positioning for absolute child
+                const cs = window.getComputedStyle(group);
+                if (cs.position === 'static') group.style.position = 'relative';
+
+                const btn = document.createElement('button');
+                btn.className = PREFIX + '-copy-turn-btn';
+                btn.textContent = 'Copy';
+                btn.title = 'Copy this turn';
+                btn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    const text = getCleanElementText(group);
+                    navigator.clipboard.writeText(text).then(() => {
+                        btn.textContent = 'Copied!';
+                        btn.classList.add('copied');
+                        setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 1500);
+                    }).catch(() => {
+                        // Fallback
+                        const ta = document.createElement('textarea'); ta.value = text;
+                        ta.style.cssText = 'position:fixed;left:-9999px'; document.body.appendChild(ta);
+                        ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+                        btn.textContent = 'Copied!';
+                        setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
+                    });
+                });
+                group.appendChild(btn);
+            });
+        },
+
+        destroy() {
+            this._stop();
+            removeCSS(PREFIX + '-copyturn');
+        }
+    };
+
+    // =====================================================================
+    //  MODULE: ERROR LOG
+    // =====================================================================
+    const ErrorLogModule = {
+        id: 'errorLog',
+        _logs: [],
+        MAX_LOGS: 100,
+
+        init() {
+            // Capture module errors
+            EventBus.on('module:error', (data) => this._add('error', data.module, data.error));
+        },
+
+        _add(level, source, message) {
+            this._logs.push({
+                time: new Date().toLocaleTimeString('en', { hour12: false }),
+                level,
+                source,
+                message: typeof message === 'string' ? message : (message?.message || String(message))
+            });
+            if (this._logs.length > this.MAX_LOGS) this._logs.shift();
+            EventBus.emit('errorlog:updated', this._logs);
+        },
+
+        getLogs() { return [...this._logs]; },
+
+        clear() {
+            this._logs = [];
+            EventBus.emit('errorlog:updated', this._logs);
+        },
+
+        getHTML() {
+            if (this._logs.length === 0) return '<span style="color:#555;font-size:10px">No errors</span>';
+            return this._logs.slice(-10).map(l => {
+                const color = l.level === 'error' ? '#f85149' : l.level === 'warn' ? '#d29922' : '#888';
+                return `<div style="font-size:9px;color:${color};margin:1px 0;word-break:break-all">` +
+                    `<span style="color:#555">${esc(l.time)}</span> ` +
+                    `<span style="color:#58a6ff">[${esc(l.source)}]</span> ${esc(l.message)}</div>`;
+            }).join('');
+        },
+
+        destroy() {}
+    };
+
+    // =====================================================================
+    //  MODULE: RE-TITLE CONVERSATION
+    // =====================================================================
+    const RetitleModule = {
+        id: 'retitle',
+        _observer: null,
+
+        init() {
+            this._start();
+        },
+
+        _start() {
+            // Watch for title elements and make them editable on click
+            if (this._observer) this._observer.disconnect();
+            let timer;
+            this._observer = new MutationObserver(() => {
+                clearTimeout(timer);
+                timer = setTimeout(() => this._inject(), 500);
+            });
+            this._observer.observe(document.body, { childList: true, subtree: true });
+            setTimeout(() => this._inject(), 2000);
+        },
+
+        _inject() {
+            // Find the active conversation title in the sidebar
+            const activeLink = document.querySelector('nav a[href*="/chat/"].bg-') ||
+                               document.querySelector('nav a[href*="/chat/"][class*="active"]') ||
+                               document.querySelector('nav a[href*="/chat/"][class*="bg-"]');
+            if (!activeLink) return;
+            if (activeLink.dataset.cueRetitle) return;
+            activeLink.dataset.cueRetitle = '1';
+
+            activeLink.addEventListener('dblclick', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                const textEl = activeLink.querySelector('div') || activeLink;
+                const origText = textEl.textContent.trim();
+                const input = document.createElement('input');
+                input.type = 'text';
+                input.value = origText;
+                input.style.cssText = 'width:100%;background:rgba(0,0,0,0.3);color:#e0e0e0;border:1px solid #58a6ff;' +
+                    'border-radius:4px;padding:2px 4px;font-size:inherit;font-family:inherit;outline:none;';
+                const save = async () => {
+                    const newTitle = input.value.trim();
+                    if (newTitle && newTitle !== origText) {
+                        // Extract conversation ID from URL
+                        const href = activeLink.getAttribute('href') || '';
+                        const match = href.match(/\/chat\/([a-f0-9-]+)/);
+                        if (match) {
+                            try {
+                                const orgs = await ClaudeAPI.getOrgs();
+                                const orgId = orgs[0]?.uuid;
+                                if (orgId) {
+                                    await fetch(`/api/organizations/${orgId}/chat_conversations/${match[1]}`, {
+                                        method: 'PATCH',
+                                        headers: { 'Content-Type': 'application/json' },
+                                        credentials: 'include',
+                                        body: JSON.stringify({ name: newTitle })
+                                    });
+                                    showToast('Title updated', 1500, 'success');
+                                }
+                            } catch (err) { showToast('Failed to rename', 2000, 'error'); }
+                        }
+                    }
+                    input.replaceWith(document.createTextNode(newTitle || origText));
+                    activeLink.dataset.cueRetitle = '';
+                    setTimeout(() => this._inject(), 100);
+                };
+                input.addEventListener('blur', save);
+                input.addEventListener('keydown', (ke) => {
+                    if (ke.key === 'Enter') { ke.preventDefault(); input.blur(); }
+                    if (ke.key === 'Escape') { input.value = origText; input.blur(); }
+                });
+                textEl.textContent = '';
+                textEl.appendChild(input);
+                input.focus();
+                input.select();
+            });
+        },
+
+        _stop() { if (this._observer) this._observer.disconnect(); },
+        destroy() { this._stop(); }
+    };
+
+    // =====================================================================
+    //  MODULE: CONVERSATION SEARCH
+    // =====================================================================
+    const ConversationSearchModule = {
+        id: 'conversationSearch',
+        STORAGE_KEY: PREFIX + '_conversation_cache',
+        items: [],
+        lastIndexed: null,
+        loading: false,
+
+        init() {
+            this._load();
+            EventBus.on('navigation', () => this.captureCurrent());
+            setTimeout(() => this.captureCurrent(), 2500);
+        },
+
+        _load() {
+            try {
+                const saved = JSON.parse(GM_getValue(this.STORAGE_KEY, '{}'));
+                this.items = Array.isArray(saved.items) ? saved.items : [];
+                this.lastIndexed = saved.lastIndexed || null;
+            } catch (e) {
+                this.items = [];
+                this.lastIndexed = null;
+            }
+        },
+
+        _save() {
+            GM_setValue(this.STORAGE_KEY, JSON.stringify({
+                lastIndexed: this.lastIndexed,
+                items: this.items.slice(0, 500)
+            }));
+        },
+
+        _normalize(raw) {
+            const id = raw.uuid || raw.id || raw.conversation_uuid || raw.conversationId;
+            if (!id) return null;
+            const title = raw.name || raw.title || raw.summary || 'Untitled conversation';
+            const updated = raw.updated_at || raw.updatedAt || raw.created_at || raw.createdAt || '';
+            const messages = raw.chat_messages || raw.messages || [];
+            const messageText = Array.isArray(messages)
+                ? messages.map(m => m.text || m.content || m.message || '').join(' ')
+                : '';
+            const text = [
+                title,
+                raw.summary || '',
+                raw.preview || '',
+                raw.last_message || '',
+                messageText
+            ].join(' ').replace(/\s+/g, ' ').trim();
+            return { id, title, updated, text };
+        },
+
+        async refresh(limit = 200) {
+            if (!Settings.get('conversationSearch') || this.loading) return this.items;
+            this.loading = true;
+            EventBus.emit('conversationSearch:loading', true);
+            try {
+                const list = await ClaudeAPI.listConversations(limit);
+                const normalized = list.map(c => this._normalize(c)).filter(Boolean);
+                const byId = new Map(this.items.map(item => [item.id, item]));
+                normalized.forEach(item => byId.set(item.id, { ...byId.get(item.id), ...item }));
+                this.items = [...byId.values()].sort((a, b) => String(b.updated).localeCompare(String(a.updated)));
+                this.lastIndexed = new Date().toISOString();
+                this._save();
+                EventBus.emit('conversationSearch:updated', this.items);
+                showToast(`Indexed ${normalized.length} conversations`, 1800, 'success');
+                return this.items;
+            } catch (e) {
+                showToast('Conversation index failed: ' + e.message, 3000, 'error');
+                EventBus.emit('module:error', { module: this.id, error: e });
+                return this.items;
+            } finally {
+                this.loading = false;
+                EventBus.emit('conversationSearch:loading', false);
+            }
+        },
+
+        captureCurrent() {
+            const id = getCurrentConversationId();
+            if (!id) return;
+            const active = document.querySelector('nav a[href*="/chat/"][class*="bg-"], nav a[href*="/chat/"][aria-current="page"]');
+            const title = (active?.innerText || document.title || 'Current conversation').replace(/\s+/g, ' ').trim();
+            const item = { id, title, updated: new Date().toISOString(), text: title };
+            const idx = this.items.findIndex(x => x.id === id);
+            if (idx >= 0) this.items[idx] = { ...this.items[idx], ...item };
+            else this.items.unshift(item);
+            this._save();
+            EventBus.emit('conversationSearch:updated', this.items);
+        },
+
+        search(query, max = 8) {
+            const q = (query || '').trim().toLowerCase();
+            const source = q
+                ? this.items.filter(item => (item.text || item.title || '').toLowerCase().includes(q))
+                : this.items;
+            return source.slice(0, max);
+        },
+
+        open(id) {
+            if (!id) return;
+            location.href = `${location.origin}/chat/${id}`;
+        },
+
+        destroy() {}
+    };
+
+    // =====================================================================
+    //  MODULE: VOICE DICTATION
+    // =====================================================================
+    const VoiceDictationModule = {
+        id: 'voiceDictation',
+        recognition: null,
+        active: false,
+
+        init() {},
+
+        isSupported() {
+            return !!(window.SpeechRecognition || window.webkitSpeechRecognition);
+        },
+
+        toggle() {
+            if (this.active) this.stop();
+            else this.start();
+        },
+
+        start() {
+            if (!Settings.get('voiceDictation')) { showToast('Voice dictation is disabled', 1800, 'warn'); return; }
+            if (!this.isSupported()) { showToast('Speech recognition is not available in this browser', 3000, 'warn'); return; }
+            const editor = DOM.getEditor();
+            if (!editor) { showToast('Editor not found', 2000, 'warn'); return; }
+            const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+            this.recognition = new SpeechRecognition();
+            this.recognition.continuous = true;
+            this.recognition.interimResults = true;
+            this.recognition.lang = document.documentElement.lang || navigator.language || 'en-US';
+            this.recognition.onresult = (event) => {
+                let finalText = '';
+                for (let i = event.resultIndex; i < event.results.length; i++) {
+                    const transcript = event.results[i][0]?.transcript || '';
+                    if (event.results[i].isFinal) finalText += transcript;
+                }
+                if (finalText.trim()) this._insert(finalText.trim());
+            };
+            this.recognition.onerror = (e) => {
+                showToast('Voice dictation error: ' + (e.error || 'unknown'), 2500, 'error');
+                EventBus.emit('voice:status', 'error');
+            };
+            this.recognition.onend = () => {
+                this.active = false;
+                EventBus.emit('voice:status', 'idle');
+            };
+            this.active = true;
+            this.recognition.start();
+            EventBus.emit('voice:status', 'listening');
+            showToast('Voice dictation listening', 1500, 'info');
+        },
+
+        stop() {
+            if (this.recognition) this.recognition.stop();
+            this.active = false;
+            EventBus.emit('voice:status', 'idle');
+        },
+
+        _insert(text) {
+            const editor = DOM.getEditor();
+            if (!editor) return;
+            editor.focus();
+            const prefix = (editor.innerText || '').trim() ? ' ' : '';
+            document.execCommand('insertText', false, prefix + text);
+            editor.dispatchEvent(new Event('input', { bubbles: true }));
+            showToast('Dictation inserted', 1200, 'success');
+        },
+
+        destroy() { this.stop(); }
+    };
+
+    // =====================================================================
+    //  MODULE: FORK CONVERSATION
+    // =====================================================================
+    const ForkConversationModule = {
+        id: 'forkConversation',
+        PENDING_KEY: PREFIX + '_pending_fork',
+        _sending: false,
+
+        init() {
+            setTimeout(() => this.trySendPending(), 1500);
+            EventBus.on('navigation', () => setTimeout(() => this.trySendPending(), 1500));
+        },
+
+        forkAt(index = null) {
+            if (!Settings.get('forkConversation')) { showToast('Fork conversation is disabled', 1800, 'warn'); return; }
+            const messages = getConversationMessages(index);
+            if (!messages.length) { showToast('No conversation turns found', 2000, 'warn'); return; }
+            let transcript = messages.map(m => `${m.role === 'human' ? 'Human' : 'Assistant'}:\n${m.text}`).join('\n\n---\n\n');
+            const maxChars = 120000;
+            if (transcript.length > maxChars) {
+                transcript = '[Older transcript omitted because it exceeded the safe paste size.]\n\n' + transcript.slice(-maxChars);
+            }
+            const prompt = `Continue from this forked Claude conversation. Preserve the decisions, constraints, and current task state from the transcript below, then proceed from the final turn.\n\n---\n\n${transcript}`;
+            GM_setValue(this.PENDING_KEY, JSON.stringify({ prompt, created: Date.now() }));
+            showToast(`Fork queued through turn ${messages.length}`, 1800, 'success');
+            location.href = `${location.origin}/new`;
+        },
+
+        async trySendPending() {
+            if (this._sending || getCurrentConversationId()) return;
+            let payload = null;
+            try { payload = JSON.parse(GM_getValue(this.PENDING_KEY, 'null')); } catch (e) { payload = null; }
+            if (!payload?.prompt) return;
+            this._sending = true;
+            try {
+                await waitForElement(SEL.editor, 20000);
+                await DOM.sendMessage(payload.prompt);
+                GM_setValue(this.PENDING_KEY, '');
+                showToast('Fork sent to new conversation', 2200, 'success');
+            } catch (e) {
+                showToast('Fork send failed: ' + e.message, 3000, 'error');
+                EventBus.emit('module:error', { module: this.id, error: e });
+            } finally {
+                this._sending = false;
+            }
+        },
+
+        destroy() {}
+    };
+
+    // =====================================================================
+    //  MODULE: SNIPPET TRIGGER
+    // =====================================================================
+    const SnippetModule = {
+        id: 'snippetTrigger',
+        STORAGE_KEY: PREFIX + '_snippets',
+        snippets: {},
+        _handler: null,
+
+        DEFAULT_SNIPPETS: {
+            ';summary': 'Please provide a concise summary of the above.',
+            ';explain': 'Please explain this in detail, step by step.',
+            ';fix': 'Please identify and fix any bugs or issues in the code above.',
+            ';review': 'Please review the code above for best practices, potential issues, and improvements.',
+            ';refactor': 'Please refactor the code above for better readability, maintainability, and performance.',
+            ';test': 'Please write comprehensive tests for the code above.',
+            ';continue': 'CONTINUE - Your response was cut off. Pick up EXACTLY where you stopped.',
+        },
+
+        init() {
+            this._load();
+            this._handler = (e) => {
+                if (!Settings.get('snippetTrigger')) return;
+                const editor = DOM.getEditor();
+                if (!editor || !editor.contains(e.target)) return;
+                if (e.key !== ' ' && e.key !== 'Enter' && e.key !== 'Tab') return;
+                // Get text before cursor
+                const sel = window.getSelection();
+                if (!sel.rangeCount) return;
+                const range = sel.getRangeAt(0);
+                const textNode = range.startContainer;
+                if (textNode.nodeType !== 3) return; // Text node only
+                const text = textNode.textContent;
+                const pos = range.startOffset;
+                // Find trigger word before cursor
+                const before = text.substring(0, pos);
+                const match = before.match(/;[\w]+$/);
+                if (!match) return;
+                const trigger = match[0];
+                const expansion = this.snippets[trigger];
+                if (!expansion) return;
+                e.preventDefault();
+                e.stopPropagation();
+                // Replace trigger with expansion
+                const start = pos - trigger.length;
+                textNode.textContent = text.substring(0, start) + expansion + text.substring(pos);
+                // Move cursor to end of expansion
+                const newRange = document.createRange();
+                newRange.setStart(textNode, start + expansion.length);
+                newRange.collapse(true);
+                sel.removeAllRanges();
+                sel.addRange(newRange);
+                // Fire input event so ProseMirror picks up the change
+                editor.dispatchEvent(new Event('input', { bubbles: true }));
+                showToast(`Expanded "${trigger}"`, 1500, 'info');
+            };
+            document.addEventListener('keydown', this._handler, true);
+        },
+
+        _load() {
+            try {
+                const saved = GM_getValue(this.STORAGE_KEY, null);
+                this.snippets = saved ? JSON.parse(saved) : { ...this.DEFAULT_SNIPPETS };
+            } catch (e) { this.snippets = { ...this.DEFAULT_SNIPPETS }; }
+        },
+
+        save() {
+            GM_setValue(this.STORAGE_KEY, JSON.stringify(this.snippets));
+        },
+
+        add(trigger, expansion) {
+            if (!trigger.startsWith(';')) trigger = ';' + trigger;
+            this.snippets[trigger] = expansion;
+            this.save();
+        },
+
+        remove(trigger) {
+            delete this.snippets[trigger];
+            this.save();
+        },
+
+        destroy() {
+            if (this._handler) document.removeEventListener('keydown', this._handler, true);
+        }
+    };
+
+    // =====================================================================
     //  MODULE: PROMPT LIBRARY
     // =====================================================================
     const PromptModule = {
@@ -1015,7 +2055,7 @@
             { id: 'testing', label: 'Testing', cat: 'pipeline', prompt: `AUTOPILOT: **TESTING PHASE**\n\nGenerate comprehensive test suite:\n1. **Unit Tests** - Each function/method independently\n2. **Integration Tests** - Component interactions\n3. **Edge Cases** - Boundary values, empty/malformed inputs\n4. **Error Paths** - Verify error handling works\n5. **Smoke Tests** - End-to-end happy path\n\nUse appropriate framework. Single-command runnable.\n\nEnd with: \`STATUS: TESTING COMPLETE\`` },
             { id: 'final_audit', label: 'Final Audit', cat: 'pipeline', prompt: `AUTOPILOT: **FINAL AUDIT**\n\nComplete final review:\n1. **Code Quality** - Dead code, duplication, complexity\n2. **Security** - SQL injection, XSS, path traversal, hardcoded secrets, input validation\n3. **Completeness** - Compare against original spec\n4. **Performance** - Bottlenecks, N+1 queries, unbounded loops\n5. **Error Messages** - Helpful and user-friendly?\n6. **Documentation** - Functions documented? README complete?\n7. **Dependencies** - All packages real and necessary?\n8. **Cross-platform** - Works on Win/macOS/Linux?\n\nFix everything. Show corrected code.\n\nEnd with: \`STATUS: FINAL_AUDIT COMPLETE\`` },
             { id: 'features', label: 'Features', cat: 'pipeline', prompt: `AUTOPILOT: **FEATURE ENHANCEMENT**\n\nAdd polish:\n1. Edge cases not yet handled\n2. UX/DX improvements - progress bars, colors, formatting\n3. Configuration - make hardcoded values configurable\n4. Logging - structured with levels\n5. Help/usage - --help, usage examples\n6. Graceful degradation - missing deps, network failures\n7. Performance - caching, lazy loading where applicable\n\nImplement all with complete code.\n\nEnd with: \`STATUS: FEATURES COMPLETE\`` },
-            { id: 'branding', label: 'Branding', cat: 'pipeline', prompt: `AUTOPILOT: **BRANDING PHASE**\n\n1. **AI Logo Prompt** - Detailed prompt for DALL-E 3 / Midjourney / Stable Diffusion to generate a professional logo\n2. **Color Palette** - 5-6 hex codes with names and usage\n3. **Tagline** - One-line project description\n4. **Icon Concepts** - 2-3 favicon/app icon ideas\n5. **ASCII Banner** - For CLI/README\n\nEnd with: \`STATUS: BRANDING COMPLETE\`` },
+            { id: 'branding', label: 'Branding', cat: 'pipeline', prompt: `AUTOPILOT: **BRANDING PHASE**\n\n1. **Logo Prompt** - Detailed prompt for DALL-E 3 / Midjourney / Stable Diffusion to generate a professional logo\n2. **Color Palette** - 5-6 hex codes with names and usage\n3. **Tagline** - One-line project description\n4. **Icon Concepts** - 2-3 favicon/app icon ideas\n5. **ASCII Banner** - For CLI/README\n\nEnd with: \`STATUS: BRANDING COMPLETE\`` },
             { id: 'packaging', label: 'Packaging', cat: 'pipeline', prompt: `AUTOPILOT: **PACKAGING PHASE**\n\n1. **Standalone Executable** - Best tool for language (PyInstaller/pkg/nexe/go build), build script, config, icon, metadata, one-command build\n2. **Portable Executable** - No install, runs from USB, self-contained, portable config\n3. **Build README** - Steps, prerequisites, troubleshooting\n4. **Release Script** - Automated build + package + hash\n\nEnd with: \`STATUS: PACKAGING COMPLETE\`` },
             { id: 'summary', label: 'Summary', cat: 'pipeline', prompt: `AUTOPILOT: **FINAL SUMMARY**\n\n1. **File Manifest** - Every file, purpose, path\n2. **Quick Start** - 3 steps or fewer\n3. **Full Setup** - All platforms\n4. **Usage Guide** - Commands, flags, config, examples\n5. **Build Guide** - Standalone + portable compilation\n6. **Architecture Diagram** - ASCII component diagram\n7. **Tech Stack** - Languages, frameworks, tools, versions\n8. **Known Limitations** - Honest assessment\n9. **Future Roadmap** - Suggested next features\n\nEnd with: \`STATUS: PROJECT COMPLETE\`` },
             { id: 'continue', label: 'Continue', cat: 'recovery', prompt: 'CONTINUE - Your response was cut off. Pick up EXACTLY where you stopped. Do not repeat anything.' },
@@ -1046,7 +2086,13 @@
                     const parsed = JSON.parse(saved);
                     this.prompts = this.DEFAULT_PROMPTS.map(def => {
                         const s = parsed.find(p => p.id === def.id);
-                        return s ? { ...def, label: s.label, prompt: s.prompt } : { ...def };
+                        return s ? {
+                            ...def,
+                            label: s.label,
+                            prompt: s.prompt,
+                            cat: s.cat || def.cat,
+                            history: Array.isArray(s.history) ? s.history : []
+                        } : { ...def, history: [] };
                     });
                     // Keep any extra custom prompts
                     parsed.forEach(p => { if (!this.prompts.find(x => x.id === p.id)) this.prompts.push(p); });
@@ -1057,19 +2103,49 @@
         },
 
         save() {
-            GM_setValue(this.STORAGE_KEY, JSON.stringify(this.prompts.map(p => ({ id: p.id, label: p.label, prompt: p.prompt, cat: p.cat }))));
+            GM_setValue(this.STORAGE_KEY, JSON.stringify(this.prompts.map(p => ({
+                id: p.id, label: p.label, prompt: p.prompt, cat: p.cat,
+                history: p.history || []
+            }))));
         },
 
         add(label, prompt, cat = 'custom') {
             const id = 'user_' + Date.now();
-            this.prompts.push({ id, label, prompt, cat });
+            this.prompts.push({ id, label, prompt, cat, history: [] });
             this.save();
             return id;
         },
 
         update(id, label, prompt) {
             const p = this.prompts.find(x => x.id === id);
-            if (p) { p.label = label; p.prompt = prompt; this.save(); }
+            if (p) {
+                // Save version history before overwriting
+                if (p.prompt && p.prompt !== prompt) {
+                    if (!p.history) p.history = [];
+                    p.history.push({ prompt: p.prompt, label: p.label, time: Date.now() });
+                    // Keep max 10 versions
+                    if (p.history.length > 10) p.history.shift();
+                }
+                p.label = label; p.prompt = prompt; this.save();
+            }
+        },
+
+        getHistory(id) {
+            const p = this.prompts.find(x => x.id === id);
+            return p?.history || [];
+        },
+
+        rollback(id, historyIdx) {
+            const p = this.prompts.find(x => x.id === id);
+            if (!p || !p.history || !p.history[historyIdx]) return false;
+            const version = p.history[historyIdx];
+            // Save current as a history entry before rollback
+            p.history.push({ prompt: p.prompt, label: p.label, time: Date.now() });
+            if (p.history.length > 10) p.history.shift();
+            p.prompt = version.prompt;
+            p.label = version.label;
+            this.save();
+            return true;
         },
 
         remove(id) {
@@ -1080,10 +2156,57 @@
         async send(promptText) {
             const text = promptText.trim();
             if (!text) { showToast('Prompt is empty', 2000, 'warn'); return; }
+            // Check for {{variable}} placeholders
+            const vars = [...new Set((text.match(/\{\{(\w+)\}\}/g) || []).map(v => v.slice(2, -2)))];
+            if (vars.length > 0) {
+                this._showVariableModal(text, vars);
+                return;
+            }
             try {
                 await DOM.sendMessage(text);
                 if (Settings.get('autoScroll')) setTimeout(() => AutoScrollModule.scrollToBottom(), 500);
             } catch (e) { showToast('Send failed: ' + e.message, 3000, 'error'); }
+        },
+
+        _showVariableModal(template, vars) {
+            const overlay = document.createElement('div');
+            overlay.className = PREFIX + '-modal-overlay';
+            const modal = document.createElement('div');
+            modal.className = PREFIX + '-modal';
+            const inputs = vars.map(v =>
+                `<div style="margin-bottom:8px">
+                    <label style="display:block;font-size:11px;color:#888;margin-bottom:2px">${esc(v)}</label>
+                    <input class="${PREFIX}-var-input" data-var="${esc(v)}" placeholder="Enter ${esc(v)}..." style="width:100%">
+                </div>`
+            ).join('');
+            setHTML(modal, `
+                <h3>Fill in variables</h3>
+                ${inputs}
+                <div class="${PREFIX}-modal-actions">
+                    <button class="${PREFIX}-modal-btn secondary" id="${PREFIX}-var-cancel">Cancel</button>
+                    <button class="${PREFIX}-modal-btn primary" id="${PREFIX}-var-send">Send</button>
+                </div>
+            `);
+            overlay.appendChild(modal);
+            document.body.appendChild(overlay);
+            overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+            $(`#${PREFIX}-var-cancel`, modal).addEventListener('click', () => overlay.remove());
+            $(`#${PREFIX}-var-send`, modal).addEventListener('click', async () => {
+                let filled = template;
+                modal.querySelectorAll('.' + PREFIX + '-var-input').forEach(inp => {
+                    const name = inp.dataset.var;
+                    const val = inp.value || name;
+                    filled = filled.split('{{' + name + '}}').join(val);
+                });
+                overlay.remove();
+                try {
+                    await DOM.sendMessage(filled);
+                    if (Settings.get('autoScroll')) setTimeout(() => AutoScrollModule.scrollToBottom(), 500);
+                } catch (e) { showToast('Send failed: ' + e.message, 3000, 'error'); }
+            });
+            // Focus first input
+            const firstInput = modal.querySelector('.' + PREFIX + '-var-input');
+            if (firstInput) setTimeout(() => firstInput.focus(), 100);
         },
 
         destroy() {}
@@ -1204,33 +2327,12 @@
     }
 
     // =====================================================================
-    //  MODULE: KEYBOARD SHORTCUTS
+    //  MODULE: PANEL TOOLS
     // =====================================================================
-    const ShortcutsModule = {
-        id: 'shortcuts',
-        _handler: null,
+    const PanelToolsModule = {
+        id: 'panelTools',
 
-        init() {
-            this._handler = (e) => {
-                if (!Settings.get('shortcuts')) return;
-                // Allow Ctrl+Shift combos even in editors (they're unusual enough)
-                const tag = (e.target.tagName || '').toLowerCase();
-                const editable = e.target.isContentEditable || tag === 'input' || tag === 'textarea';
-                if (!e.ctrlKey || !e.shiftKey) { if (editable) return; }
-                if (!e.ctrlKey || !e.shiftKey) return;
-
-                switch (e.key.toUpperCase()) {
-                    case 'D': e.preventDefault(); ControlPanel.toggle(); break;
-                    case 'K': e.preventDefault(); this._copyLastCode(); break;
-                    case 'C':
-                        // Only if no text selected (don't override normal Ctrl+Shift+C)
-                        if (window.getSelection().toString().length === 0) { e.preventDefault(); this._copyLastResponse(); }
-                        break;
-                    case 'E': e.preventDefault(); this._exportChat(); break;
-                }
-            };
-            document.addEventListener('keydown', this._handler, true);
-        },
+        init() {},
 
         _copyLastCode() {
             const blocks = scanCodeBlocks();
@@ -1256,29 +2358,86 @@
             });
         },
 
-        _exportChat() {
+        _showExportMenu() {
             const main = document.querySelector('main');
             if (!main) { showToast('No conversation found', 2000, 'warn'); return; }
             const groups = main.querySelectorAll(SEL.msgGroup);
             if (groups.length === 0) { showToast('No messages found', 2000, 'warn'); return; }
-            let md = '# Claude Conversation Export\n_Exported: ' + new Date().toISOString() + '_\n\n---\n\n';
+
+            // Gather messages
+            const messages = [];
             groups.forEach((g) => {
                 const isUser = !!g.querySelector(SEL.userMsg);
-                const text = g.innerText.trim();
-                if (text) md += '## ' + (isUser ? 'Human' : 'Assistant') + '\n\n' + text + '\n\n---\n\n';
+                const text = getCleanElementText(g);
+                const html = g.innerHTML;
+                if (text) messages.push({ role: isUser ? 'human' : 'assistant', text, html });
             });
-            const blob = new Blob([md], { type: 'text/markdown' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url; a.download = 'claude-chat-' + new Date().toISOString().slice(0, 10) + '.md';
-            document.body.appendChild(a); a.click(); document.body.removeChild(a);
-            URL.revokeObjectURL(url);
-            showToast('Chat exported!', 2000, 'success');
+
+            const overlay = document.createElement('div');
+            overlay.className = PREFIX + '-modal-overlay';
+            const modal = document.createElement('div');
+            modal.className = PREFIX + '-modal';
+            setHTML(modal, `
+                <h3>Export Conversation</h3>
+                <p style="color:#888;font-size:12px;margin:0 0 12px">${messages.length} messages</p>
+                <div style="display:flex;gap:6px;flex-wrap:wrap">
+                    <button class="${PREFIX}-modal-btn primary" data-fmt="md">Markdown</button>
+                    <button class="${PREFIX}-modal-btn primary" data-fmt="json" style="background:#bc8cff;border-color:#bc8cff">JSON</button>
+                    <button class="${PREFIX}-modal-btn primary" data-fmt="html" style="background:#d29922;border-color:#d29922">HTML</button>
+                </div>
+                <div class="${PREFIX}-modal-actions" style="margin-top:12px">
+                    <button class="${PREFIX}-modal-btn secondary" id="${PREFIX}-export-cancel">Cancel</button>
+                </div>
+            `);
+            overlay.appendChild(modal);
+            document.body.appendChild(overlay);
+            overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+            $(`#${PREFIX}-export-cancel`, modal).addEventListener('click', () => overlay.remove());
+
+            modal.querySelectorAll('[data-fmt]').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const fmt = btn.dataset.fmt;
+                    const datestamp = new Date().toISOString().slice(0, 10);
+                    let content, mime, ext;
+
+                    if (fmt === 'md') {
+                        content = '# Claude Conversation Export\n_Exported: ' + new Date().toISOString() + '_\n\n---\n\n';
+                        messages.forEach(m => { content += '## ' + (m.role === 'human' ? 'Human' : 'Assistant') + '\n\n' + m.text + '\n\n---\n\n'; });
+                        mime = 'text/markdown'; ext = 'md';
+                    } else if (fmt === 'json') {
+                        content = JSON.stringify({
+                            exported: new Date().toISOString(),
+                            messages: messages.map(m => ({ role: m.role, content: m.text }))
+                        }, null, 2);
+                        mime = 'application/json'; ext = 'json';
+                    } else {
+                        content = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Claude Chat Export</title>' +
+                            '<style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:800px;margin:40px auto;padding:0 20px;background:#1a1a2e;color:#e0e0e0}' +
+                            '.msg{margin:20px 0;padding:16px;border-radius:8px;border-left:4px solid}.human{border-color:#58a6ff;background:rgba(88,166,255,0.05)}' +
+                            '.assistant{border-color:#bc8cff;background:rgba(188,140,255,0.05)}.role{font-size:12px;font-weight:700;margin-bottom:8px;text-transform:uppercase}' +
+                            '.human .role{color:#58a6ff}.assistant .role{color:#bc8cff}pre{background:rgba(0,0,0,0.3);padding:12px;border-radius:6px;overflow-x:auto}</style></head>' +
+                            '<body><h1>Claude Conversation Export</h1><p style="color:#888">Exported: ' + new Date().toISOString() + '</p>';
+                        messages.forEach(m => {
+                            content += '<div class="msg ' + m.role + '"><div class="role">' + (m.role === 'human' ? 'Human' : 'Assistant') + '</div>' +
+                                '<div>' + m.text.replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>') + '</div></div>';
+                        });
+                        content += '</body></html>';
+                        mime = 'text/html'; ext = 'html';
+                    }
+
+                    const blob = new Blob([content], { type: mime });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url; a.download = 'claude-chat-' + datestamp + '.' + ext;
+                    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                    overlay.remove();
+                    showToast('Chat exported as ' + ext.toUpperCase() + '!', 2000, 'success');
+                });
+            });
         },
 
-        destroy() {
-            if (this._handler) document.removeEventListener('keydown', this._handler, true);
-        }
+        destroy() {}
     };
 
     // =====================================================================
@@ -1290,6 +2449,7 @@
         _usageData: null,
         _claudeSettings: null,
         _refreshTimer: null,
+        _turnCursor: 0,
 
         FEATURES: [
             { key: 'enabled_monkeys_in_a_barrel', name: 'Code Execution', desc: 'Virtual code environment', exclusive: 'enabled_artifacts_attachments' },
@@ -1299,8 +2459,28 @@
             { key: 'enabled_sourdough', name: 'Projects', desc: 'Project memory' },
         ],
 
+        USAGE_PLANS: {
+            pro: { name: 'Pro', multiplier: 1 },
+            max5: { name: 'Max 5x', multiplier: 5 },
+            max20: { name: 'Max 20x', multiplier: 20 },
+        },
+        LOCAL_USAGE_BASELINE: { session: 20, fiveHour: 45, sevenDay: 225 },
+
+        show() {
+            if (!this._panel) return;
+            this._panel.classList.remove(PREFIX + '-panel-hidden');
+            this._panel.style.pointerEvents = 'auto';
+            this._visible = true;
+        },
+        hide(force = false) {
+            if (!this._panel || (Settings.get('panelPinned') && !force)) return;
+            this._panel.classList.add(PREFIX + '-panel-hidden');
+            this._visible = false;
+        },
         toggle() {
-            if (this._panel) { this._panel.classList.toggle(PREFIX + '-panel-hidden'); this._visible = !this._visible; }
+            if (!this._panel) return;
+            if (this._panel.classList.contains(PREFIX + '-panel-hidden')) this.show();
+            else this.hide(true);
         },
 
         async build() {
@@ -1313,6 +2493,7 @@
 
             setHTML(this._panel, this._getHTML());
             document.body.appendChild(this._panel);
+            this._applyPanelChrome();
             this._bindEvents();
             this._loadData();
 
@@ -1337,7 +2518,8 @@
 
                 /* Panel container */
                 #${PREFIX}-panel {
-                    position: fixed; top: 0; right: 0; width: 310px; height: 100vh;
+                    position: fixed; top: 0; right: 0; width: var(--cue-panel-width, 320px); height: 100vh;
+                    min-width: 280px; max-width: min(640px, 90vw);
                     background: #0d0d14; border-left: 1px solid #2a2a3a;
                     z-index: 99999; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
                     color: #c8c8d8; font-size: 11px; overflow-y: auto; overflow-x: hidden;
@@ -1346,8 +2528,14 @@
                     display: flex; flex-direction: column;
                 }
                 #${PREFIX}-panel.${PREFIX}-panel-hidden { transform: translateX(100%); pointer-events: none; }
+                #${PREFIX}-panel.${PREFIX}-panel-pinned { transform: translateX(0); pointer-events: auto; }
                 #${PREFIX}-panel::-webkit-scrollbar { width: 4px; }
                 #${PREFIX}-panel::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 2px; }
+                #${PREFIX}-panel-resize {
+                    position: absolute; top: 0; left: -4px; width: 8px; height: 100%;
+                    cursor: ew-resize; z-index: 1;
+                }
+                #${PREFIX}-panel-resize:hover { background: rgba(88,166,255,0.14); }
 
                 /* Header - minimal */
                 .${PREFIX}-hdr {
@@ -1357,11 +2545,16 @@
                 }
                 .${PREFIX}-hdr h2 { margin: 0; font-size: 12px; font-weight: 600; color: #e8e8f0; }
                 .${PREFIX}-hdr-ver { font-size: 9px; color: #555; margin-left: 4px; }
+                .${PREFIX}-hdr-actions { display: flex; align-items: center; gap: 2px; }
+                .${PREFIX}-icon-btn,
                 .${PREFIX}-close {
                     background: none; border: none; color: #555; width: 20px; height: 20px;
                     cursor: pointer; font-size: 14px; display: flex; align-items: center;
                     justify-content: center; border-radius: 4px;
                 }
+                .${PREFIX}-icon-btn { font-size: 11px; font-weight: 700; }
+                .${PREFIX}-icon-btn.active { color: #58a6ff; background: rgba(88,166,255,0.1); }
+                .${PREFIX}-icon-btn:hover { color: #c8c8d8; background: rgba(255,255,255,0.06); }
                 .${PREFIX}-close:hover { color: #f88; background: rgba(255,80,80,0.1); }
 
                 /* Sections - ultra compact */
@@ -1422,6 +2615,7 @@
                 .${PREFIX}-usage-fill.warn { background: linear-gradient(90deg, #d29922, #e8a020); }
                 .${PREFIX}-usage-fill.danger { background: linear-gradient(90deg, #f85149, #ff6b6b); }
                 .${PREFIX}-usage-pct { font-size: 10px; color: #888; }
+                .${PREFIX}-usage-local { color: #666; font-size: 9px; }
 
                 /* Feature toggle rows - compact */
                 .${PREFIX}-feat-row {
@@ -1467,6 +2661,30 @@
                 }
                 .${PREFIX}-prompt-btn:hover { background: rgba(88,166,255,0.1); border-color: #58a6ff40; color: #fff; }
                 .${PREFIX}-prompt-cat { display: none; }
+                .${PREFIX}-tool-btn {
+                    padding: 3px 8px; border-radius: 4px; border: 1px solid #2a2a3a;
+                    background: rgba(255,255,255,0.03); color: #c8c8d8;
+                    cursor: pointer; font-size: 10px; transition: all 0.2s;
+                }
+                .${PREFIX}-tool-btn:hover { background: rgba(88,166,255,0.1); border-color: #58a6ff40; color: #fff; }
+                .${PREFIX}-tool-btn.primary { color: #58a6ff; }
+                .${PREFIX}-tool-btn.warn { color: #d29922; }
+                .${PREFIX}-tool-btn.success { color: #3fb950; }
+                .${PREFIX}-search-input {
+                    width: 100%; box-sizing: border-box; background: #1a1a2a; color: #c8c8d8;
+                    border: 1px solid #2a2a3a; border-radius: 4px; padding: 4px 6px;
+                    font-size: 10px; outline: none; margin: 3px 0;
+                }
+                .${PREFIX}-search-input:focus { border-color: #58a6ff; }
+                .${PREFIX}-search-result {
+                    display: flex; justify-content: space-between; align-items: center; gap: 4px;
+                    padding: 3px 0; border-top: 1px solid rgba(255,255,255,0.04);
+                }
+                .${PREFIX}-search-title {
+                    min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+                    font-size: 10px; color: #c8c8d8;
+                }
+                .${PREFIX}-search-date { color: #555; font-size: 9px; flex-shrink: 0; }
 
                 /* Prompt editor modal */
                 .${PREFIX}-modal-overlay {
@@ -1499,33 +2717,59 @@
                 .${PREFIX}-modal-btn.danger { background: transparent; color: #f85149; border-color: rgba(248,81,73,0.3); }
                 .${PREFIX}-modal-btn.danger:hover { background: rgba(248,81,73,0.1); }
 
-                /* Shortcut keys */
-                .${PREFIX}-shortcut-hint {
-                    display: inline-block; padding: 0px 4px; background: rgba(255,255,255,0.06);
-                    border: 1px solid rgba(255,255,255,0.1); border-radius: 3px;
-                    font-size: 9px; color: #666; font-family: monospace;
-                }
-
                 /* Settings grid for two-column layout */
                 .${PREFIX}-settings-grid {
                     display: grid; grid-template-columns: 1fr 1fr; gap: 0 6px;
                 }
+
+                /* Turn navigator */
+                .${PREFIX}-turn-item {
+                    display: flex; align-items: center; gap: 4px;
+                    padding: 1px 4px; cursor: pointer; border-radius: 3px;
+                    font-size: 10px; color: #888; transition: background 0.15s;
+                    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+                }
+                .${PREFIX}-turn-item:hover { background: rgba(88,166,255,0.08); color: #c8c8d8; }
+                .${PREFIX}-turn-item .turn-role {
+                    font-size: 9px; font-weight: 600; min-width: 14px; text-align: center;
+                }
+                .${PREFIX}-turn-item .turn-role.human { color: #58a6ff; }
+                .${PREFIX}-turn-item .turn-role.ai { color: #bc8cff; }
+                .${PREFIX}-turn-item .turn-preview { overflow: hidden; text-overflow: ellipsis; flex: 1; }
+                .${PREFIX}-turn-fork {
+                    border: 0; background: transparent; color: #555; cursor: pointer;
+                    font-size: 10px; padding: 0 2px; border-radius: 3px;
+                }
+                .${PREFIX}-turn-fork:hover { color: #58a6ff; background: rgba(88,166,255,0.08); }
             `);
         },
 
         _getHTML() {
             return `
+                <div id="${PREFIX}-panel-resize"></div>
                 <div class="${PREFIX}-hdr">
                     <h2>CUE <span class="${PREFIX}-hdr-ver">v${VERSION}</span></h2>
-                    <button class="${PREFIX}-close" id="${PREFIX}-panel-close">&times;</button>
+                    <div class="${PREFIX}-hdr-actions">
+                        <button class="${PREFIX}-icon-btn" id="${PREFIX}-panel-pin" title="Pin panel">P</button>
+                        <button class="${PREFIX}-close" id="${PREFIX}-panel-close">&times;</button>
+                    </div>
                 </div>
 
                 <div class="${PREFIX}-section">
                     <div class="${PREFIX}-row"><span class="${PREFIX}-row-label">Response</span><span id="${PREFIX}-status"><span class="${PREFIX}-status-dot idle"></span>Idle</span></div>
                     <div class="${PREFIX}-row"><span class="${PREFIX}-row-label">Last</span><span id="${PREFIX}-last-resp" style="color:#666;font-size:10px">--</span></div>
+                    <div class="${PREFIX}-row"><span class="${PREFIX}-row-label">Cost</span><span id="${PREFIX}-cost-display" style="color:#d29922;font-size:10px">$0.000</span></div>
                 </div>
 
                 <div class="${PREFIX}-section">
+                    <div class="${PREFIX}-row">
+                        <span class="${PREFIX}-row-label" style="font-size:10px">Usage Plan</span>
+                        <select class="${PREFIX}-select" id="${PREFIX}-set-usagePlan">
+                            <option value="pro">Pro</option>
+                            <option value="max5">Max 5x</option>
+                            <option value="max20">Max 20x</option>
+                        </select>
+                    </div>
                     <div id="${PREFIX}-usage-content"><span style="color:#555;font-size:10px">Loading usage...</span></div>
                 </div>
 
@@ -1538,6 +2782,7 @@
                         <span><span id="${PREFIX}-ctx-burn">0</span>/min</span>
                     </div>
                     <div id="${PREFIX}-ctx-advice" style="font-size:9px;color:#3fb950"></div>
+                    <div id="${PREFIX}-cache-indicator" style="font-size:9px;color:#555;margin-top:1px"></div>
                 </div>
 
                 <div class="${PREFIX}-section" id="${PREFIX}-features-section">
@@ -1560,8 +2805,14 @@
                         ${this._makeToggle('responseMonitor', 'Resp Mon')}
                         ${this._makeToggle('notifySound', 'Sound')}
                         ${this._makeToggle('notifyFlash', 'Tab Flash')}
+                        ${this._makeToggle('codeFold', 'Code Fold')}
+                        ${this._makeToggle('copyTurn', 'Copy Turn')}
+                        ${this._makeToggle('snippetTrigger', 'Snippets')}
+                        ${this._makeToggle('conversationSearch', 'Chat Search')}
+                        ${this._makeToggle('forkConversation', 'Fork')}
+                        ${this._makeToggle('voiceDictation', 'Voice')}
+                        ${this._makeToggle('focusMode', 'Focus')}
                         ${this._makeToggle('domTrimmer', 'DOM Trim')}
-                        ${this._makeToggle('shortcuts', 'Shortcuts')}
                     </div>
                     <div class="${PREFIX}-row" style="margin-top:2px">
                         <span class="${PREFIX}-row-label" style="font-size:10px">Theme</span>
@@ -1569,7 +2820,18 @@
                             <option value="oceanic">Oceanic</option>
                             <option value="midnight">Midnight</option>
                             <option value="mocha">Catppuccin Mocha</option>
+                            <option value="macchiato">Catppuccin Macchiato</option>
+                            <option value="frappe">Catppuccin Frappé</option>
+                            <option value="latte">Catppuccin Latte</option>
                             <option value="none">None</option>
+                        </select>
+                    </div>
+                    <div class="${PREFIX}-row" style="margin-top:2px">
+                        <span class="${PREFIX}-row-label" style="font-size:10px">Density</span>
+                        <select class="${PREFIX}-select" id="${PREFIX}-set-densityMode">
+                            <option value="comfortable">Comfortable</option>
+                            <option value="compact">Compact</option>
+                            <option value="reading">Reading</option>
                         </select>
                     </div>
                     <div class="${PREFIX}-row">
@@ -1580,6 +2842,10 @@
                         <span class="${PREFIX}-row-label" style="font-size:10px">Keep: <span id="${PREFIX}-trim-val">${Settings.get('domKeepVisible')}</span> msgs</span>
                         <input type="range" class="${PREFIX}-slider" id="${PREFIX}-set-domKeepVisible" min="5" max="100" value="${Settings.get('domKeepVisible')}" style="width:100px">
                     </div>
+                    <div class="${PREFIX}-row">
+                        <span class="${PREFIX}-row-label" style="font-size:10px">Panel: <span id="${PREFIX}-panel-width-val">${Settings.get('panelWidth')}</span>px</span>
+                        <input type="range" class="${PREFIX}-slider" id="${PREFIX}-set-panelWidth" min="280" max="640" value="${Settings.get('panelWidth')}" style="width:100px">
+                    </div>
                 </div>
 
                 <div class="${PREFIX}-section">
@@ -1587,14 +2853,53 @@
                     <button class="${PREFIX}-prompt-btn" id="${PREFIX}-prompt-add" style="width:100%;justify-content:center;color:#58a6ff;margin-top:1px">+ Add Prompt</button>
                 </div>
 
-                <div class="${PREFIX}-section" style="border-bottom:none">
-                    <div style="display:grid;grid-template-columns:auto 1fr;gap:1px 8px;font-size:9px;color:#555">
-                        <span class="${PREFIX}-shortcut-hint">Ctrl+Shift+D</span><span>Panel</span>
-                        <span class="${PREFIX}-shortcut-hint">Ctrl+Shift+K</span><span>Copy code</span>
-                        <span class="${PREFIX}-shortcut-hint">Ctrl+Shift+C</span><span>Copy resp</span>
-                        <span class="${PREFIX}-shortcut-hint">Ctrl+Shift+E</span><span>Export</span>
+                <div class="${PREFIX}-section">
+                    <div style="display:flex;justify-content:space-between;align-items:center">
+                        <span class="${PREFIX}-section-title" style="margin:0">Conversation Search</span>
+                        <button class="${PREFIX}-tool-btn primary" id="${PREFIX}-search-refresh">Index</button>
                     </div>
-                    <div style="text-align:center;margin-top:3px"><span style="cursor:pointer;color:#58a6ff;font-size:9px" id="${PREFIX}-reset-settings">Reset All</span></div>
+                    <input class="${PREFIX}-search-input" id="${PREFIX}-search-query" placeholder="Search cached conversations">
+                    <div id="${PREFIX}-search-meta" style="font-size:9px;color:#555"></div>
+                    <div id="${PREFIX}-search-results"></div>
+                </div>
+
+                <div class="${PREFIX}-section">
+                    <div class="${PREFIX}-section-title">Tools</div>
+                    <div style="display:flex;gap:4px;flex-wrap:wrap">
+                        <button class="${PREFIX}-tool-btn primary" id="${PREFIX}-voice-toggle">Voice</button>
+                        <button class="${PREFIX}-tool-btn primary" id="${PREFIX}-fork-latest">Fork Latest</button>
+                        <button class="${PREFIX}-tool-btn" id="${PREFIX}-copy-last-code">Copy Code</button>
+                        <button class="${PREFIX}-tool-btn" id="${PREFIX}-copy-last-response">Copy Response</button>
+                        <button class="${PREFIX}-tool-btn" id="${PREFIX}-export-chat">Export Chat</button>
+                    </div>
+                    <div id="${PREFIX}-voice-status" style="font-size:9px;color:#555;margin-top:3px">Voice idle</div>
+                </div>
+
+                <div class="${PREFIX}-section">
+                    <div style="display:flex;justify-content:space-between;align-items:center">
+                        <span class="${PREFIX}-section-title" style="margin:0">Turn Navigator</span>
+                        <span style="display:flex;gap:3px">
+                            <button class="${PREFIX}-tool-btn" id="${PREFIX}-turn-prev">Prev</button>
+                            <button class="${PREFIX}-tool-btn" id="${PREFIX}-turn-next">Next</button>
+                        </span>
+                    </div>
+                    <div id="${PREFIX}-turn-nav" style="max-height:120px;overflow-y:auto"></div>
+                </div>
+
+                <div class="${PREFIX}-section">
+                    <div style="display:flex;justify-content:space-between;align-items:center">
+                        <span class="${PREFIX}-section-title" style="margin:0">Error Log</span>
+                        <span style="cursor:pointer;color:#555;font-size:9px" id="${PREFIX}-clear-errors">Clear</span>
+                    </div>
+                    <div id="${PREFIX}-error-log"></div>
+                </div>
+
+                <div class="${PREFIX}-section" style="border-bottom:none">
+                    <div style="display:flex;justify-content:center;gap:8px;margin-top:3px">
+                        <span style="cursor:pointer;color:#58a6ff;font-size:9px" id="${PREFIX}-export-config">Export</span>
+                        <span style="cursor:pointer;color:#58a6ff;font-size:9px" id="${PREFIX}-import-config">Import</span>
+                        <span style="cursor:pointer;color:#f85149;font-size:9px" id="${PREFIX}-reset-settings">Reset All</span>
+                    </div>
                 </div>
             `;
         },
@@ -1613,7 +2918,12 @@
 
         _bindEvents() {
             // Close button
-            $(`#${PREFIX}-panel-close`).addEventListener('click', () => this.toggle());
+            $(`#${PREFIX}-panel-close`).addEventListener('click', () => {
+                if (Settings.get('panelPinned')) Settings.set('panelPinned', false);
+                this.hide(true);
+            });
+            $(`#${PREFIX}-panel-pin`).addEventListener('click', () => Settings.toggle('panelPinned'));
+            this._bindPanelResize();
 
             // Toggle switches
             this._panel.querySelectorAll(`input[data-setting]`).forEach(cb => {
@@ -1624,6 +2934,19 @@
             const themeSelect = $(`#${PREFIX}-set-themeVariant`);
             themeSelect.value = Settings.get('themeVariant');
             themeSelect.addEventListener('change', () => Settings.set('themeVariant', themeSelect.value));
+
+            // Density mode select
+            const densitySelect = $(`#${PREFIX}-set-densityMode`);
+            densitySelect.value = Settings.get('densityMode');
+            densitySelect.addEventListener('change', () => Settings.set('densityMode', densitySelect.value));
+
+            // Usage plan select
+            const usagePlanSelect = $(`#${PREFIX}-set-usagePlan`);
+            usagePlanSelect.value = Settings.get('usagePlan');
+            usagePlanSelect.addEventListener('change', () => {
+                Settings.set('usagePlan', usagePlanSelect.value);
+                this._renderUsage(this._usageData);
+            });
 
             // Width slider
             const widthSlider = $(`#${PREFIX}-set-chatWidthPct`);
@@ -1639,21 +2962,164 @@
                 Settings.set('domKeepVisible', parseInt(trimSlider.value));
             });
 
+            // Panel width slider
+            const panelWidthSlider = $(`#${PREFIX}-set-panelWidth`);
+            panelWidthSlider.addEventListener('input', () => {
+                const width = parseInt(panelWidthSlider.value);
+                $(`#${PREFIX}-panel-width-val`).textContent = width;
+                Settings.set('panelWidth', width);
+            });
+
             // Reset settings
             $(`#${PREFIX}-reset-settings`).addEventListener('click', () => {
-                if (confirm('Reset all settings to defaults?')) { Settings.reset(); location.reload(); }
+                Settings.reset();
+                showToast('Settings reset', 1200, 'success');
+                setTimeout(() => location.reload(), 600);
+            });
+
+            // Export config
+            $(`#${PREFIX}-export-config`).addEventListener('click', () => {
+                const config = {};
+                Object.keys(Settings._defaults).forEach(k => { config[k] = Settings.get(k); });
+                config._prompts = PromptModule.prompts.map(p => ({ id: p.id, label: p.label, prompt: p.prompt, cat: p.cat }));
+                const blob = new Blob([JSON.stringify(config, null, 2)], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url; a.download = 'cue-config-' + new Date().toISOString().slice(0, 10) + '.json';
+                document.body.appendChild(a); a.click(); document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+                showToast('Config exported!', 2000, 'success');
+            });
+
+            // Import config
+            $(`#${PREFIX}-import-config`).addEventListener('click', () => {
+                const input = document.createElement('input');
+                input.type = 'file'; input.accept = '.json';
+                input.addEventListener('change', () => {
+                    const file = input.files[0]; if (!file) return;
+                    const reader = new FileReader();
+                    reader.onload = (e) => {
+                        try {
+                            const config = JSON.parse(e.target.result);
+                            let imported = 0;
+                            Object.keys(Settings._defaults).forEach(k => {
+                                if (k in config) { Settings.set(k, config[k]); imported++; }
+                            });
+                            if (config._prompts && Array.isArray(config._prompts)) {
+                                config._prompts.forEach(p => {
+                                    const existing = PromptModule.prompts.find(x => x.id === p.id);
+                                    if (existing) { existing.label = p.label; existing.prompt = p.prompt; existing.cat = p.cat; }
+                                    else { PromptModule.prompts.push(p); }
+                                });
+                                PromptModule.save();
+                            }
+                            showToast(`Imported ${imported} settings`, 2500, 'success');
+                            setTimeout(() => location.reload(), 1000);
+                        } catch (err) { showToast('Invalid config file: ' + err.message, 3000, 'error'); }
+                    };
+                    reader.readAsText(file);
+                });
+                input.click();
             });
 
             // Add prompt button
             $(`#${PREFIX}-prompt-add`).addEventListener('click', () => this._showPromptEditor());
 
+            // Conversation search
+            const searchInput = $(`#${PREFIX}-search-query`);
+            searchInput.addEventListener('input', () => this._renderConversationSearch(searchInput.value));
+            $(`#${PREFIX}-search-refresh`).addEventListener('click', async () => {
+                await ConversationSearchModule.refresh();
+                this._renderConversationSearch(searchInput.value);
+            });
+
+            // Tools
+            $(`#${PREFIX}-voice-toggle`).addEventListener('click', () => VoiceDictationModule.toggle());
+            $(`#${PREFIX}-fork-latest`).addEventListener('click', () => ForkConversationModule.forkAt(null));
+            $(`#${PREFIX}-copy-last-code`).addEventListener('click', () => PanelToolsModule._copyLastCode());
+            $(`#${PREFIX}-copy-last-response`).addEventListener('click', () => PanelToolsModule._copyLastResponse());
+            $(`#${PREFIX}-export-chat`).addEventListener('click', () => PanelToolsModule._showExportMenu());
+            $(`#${PREFIX}-turn-prev`).addEventListener('click', () => this._jumpTurn(-1));
+            $(`#${PREFIX}-turn-next`).addEventListener('click', () => this._jumpTurn(1));
+
+            // Clear error log
+            $(`#${PREFIX}-clear-errors`).addEventListener('click', () => {
+                ErrorLogModule.clear();
+                this._renderErrorLog();
+            });
+
             // Listen for updates
             EventBus.on('response:status', (s) => this._updateStatus(s));
             EventBus.on('response:complete', (d) => this._updateLastResponse(d));
-            EventBus.on('context:updated', (h) => this._updateContext(h));
+            EventBus.on('context:updated', (h) => { this._updateContext(h); this._updateTurnNav(); });
             EventBus.on('stream:messageLimit', (ml) => this._updateUsageFromStream(ml));
+            EventBus.on('usage:localUpdated', () => this._renderUsage(this._usageData));
+            EventBus.on('errorlog:updated', () => this._renderErrorLog());
+            EventBus.on('cost:updated', (d) => this._updateCost(d));
+            EventBus.on('cache:hit', () => this._updateCache('hit'));
+            EventBus.on('cache:miss', () => this._updateCache('miss'));
+            EventBus.on('cache:timer', (d) => this._updateCacheTimer(d));
+            EventBus.on('cache:expired', () => this._updateCache('expired'));
+            EventBus.on('conversationSearch:updated', () => this._renderConversationSearch(searchInput.value));
+            EventBus.on('conversationSearch:loading', (loading) => this._setSearchLoading(loading));
+            EventBus.on('voice:status', (status) => this._updateVoiceStatus(status));
+            EventBus.on('setting:panelPinned', () => this._applyPanelChrome());
+            EventBus.on('setting:panelWidth', () => this._applyPanelChrome());
 
             this._renderPrompts();
+            this._renderUsage(this._usageData);
+            this._renderConversationSearch('');
+            this._renderErrorLog();
+            this._updateTurnNav();
+        },
+
+        _applyPanelChrome() {
+            if (!this._panel) return;
+            const width = Math.max(280, Math.min(640, parseInt(Settings.get('panelWidth')) || 320));
+            this._panel.style.setProperty('--cue-panel-width', width + 'px');
+            const widthLabel = $(`#${PREFIX}-panel-width-val`);
+            if (widthLabel) widthLabel.textContent = width;
+            const widthSlider = $(`#${PREFIX}-set-panelWidth`);
+            if (widthSlider) widthSlider.value = width;
+            const pinned = Settings.get('panelPinned');
+            this._panel.classList.toggle(PREFIX + '-panel-pinned', pinned);
+            const pin = $(`#${PREFIX}-panel-pin`);
+            if (pin) {
+                pin.classList.toggle('active', pinned);
+                pin.textContent = pinned ? 'U' : 'P';
+                pin.title = pinned ? 'Unpin panel' : 'Pin panel';
+            }
+            if (pinned) this.show();
+        },
+
+        _bindPanelResize() {
+            const handle = $(`#${PREFIX}-panel-resize`);
+            if (!handle) return;
+            let dragging = false;
+            let nextWidth = Settings.get('panelWidth');
+            const onMove = (e) => {
+                if (!dragging) return;
+                nextWidth = Math.max(280, Math.min(640, window.innerWidth - e.clientX));
+                this._panel.style.setProperty('--cue-panel-width', nextWidth + 'px');
+                const label = $(`#${PREFIX}-panel-width-val`);
+                if (label) label.textContent = nextWidth;
+                const slider = $(`#${PREFIX}-set-panelWidth`);
+                if (slider) slider.value = nextWidth;
+            };
+            const onUp = () => {
+                if (!dragging) return;
+                dragging = false;
+                document.removeEventListener('mousemove', onMove);
+                document.removeEventListener('mouseup', onUp);
+                Settings.set('panelWidth', Math.round(nextWidth));
+            };
+            handle.addEventListener('mousedown', (e) => {
+                dragging = true;
+                nextWidth = Settings.get('panelWidth');
+                e.preventDefault();
+                document.addEventListener('mousemove', onMove);
+                document.addEventListener('mouseup', onUp);
+            });
         },
 
         async _loadData() {
@@ -1675,10 +3141,20 @@
         _renderUsage(data) {
             const container = $(`#${PREFIX}-usage-content`);
             if (!container) return;
-            let html = '';
-            const addBar = (label, info) => {
+            if (!Settings.get('usageMonitor')) {
+                setHTML(container, '<span style="color:#555;font-size:10px">Usage monitor disabled</span>');
+                return;
+            }
+            const plan = this.USAGE_PLANS[Settings.get('usagePlan')] || this.USAGE_PLANS.pro;
+            const local = UsageTrackerModule.getStats();
+            let html = `<div style="display:flex;justify-content:space-between;font-size:9px;color:#555;margin-bottom:2px">
+                    <span>${plan.name} thresholds</span><span>${local.totalCached} cached sends</span>
+                </div>`;
+            const addBar = (label, info, source = 'server') => {
                 if (!info) return;
-                const pct = Math.round(info.utilization || 0);
+                let util = info.utilization ?? info.used_percentage ?? info.percent ?? 0;
+                if (typeof util === 'string') util = parseFloat(util);
+                const pct = Math.max(0, Math.min(100, Math.round(util <= 1 ? util * 100 : util)));
                 const cls = pct > 80 ? 'danger' : pct > 60 ? 'warn' : '';
                 const reset = info.resets_at ? this._fmtReset(info.resets_at) : '';
                 html += `<div style="margin-bottom:3px">
@@ -1686,12 +3162,23 @@
                             <span>${label}</span><span>${pct}%${reset ? ' ' + reset : ''}</span>
                         </div>
                         <div class="${PREFIX}-usage-bar"><div class="${PREFIX}-usage-fill ${cls}" style="width:${pct}%"></div></div>
+                        ${source !== 'server' ? `<div class="${PREFIX}-usage-local">${source}</div>` : ''}
                     </div>`;
             };
-            addBar('Session (5h)', data.five_hour);
-            addBar('Weekly', data.seven_day);
-            addBar('Opus', data.seven_day_opus);
-            setHTML(container, html || '<span style="color:#555;font-size:10px">No usage data</span>');
+            const localPct = (count, key) => {
+                const limit = (this.LOCAL_USAGE_BASELINE[key] || 1) * plan.multiplier;
+                return Math.min(1, count / limit);
+            };
+            addBar('Tab Session', { utilization: localPct(local.session, 'session') }, `${local.session} sends this tab`);
+            if (data) {
+                addBar('5h Window', data.five_hour || data.fiveHour || data['5h']);
+                addBar('7d Window', data.seven_day || data.sevenDay || data['7d']);
+                addBar('Opus Weekly', data.seven_day_opus || data.opus || data.opus_weekly);
+            } else {
+                addBar('5h Window', { utilization: localPct(local.fiveHour, 'fiveHour') }, `${local.fiveHour} local sends`);
+                addBar('7d Window', { utilization: localPct(local.sevenDay, 'sevenDay') }, `${local.sevenDay} local sends`);
+            }
+            setHTML(container, html);
         },
 
         _updateUsageFromStream(ml) {
@@ -1699,7 +3186,11 @@
             if (!container) return;
             const windows = ml.windows;
             if (!windows) return;
-            let html = '';
+            const plan = this.USAGE_PLANS[Settings.get('usagePlan')] || this.USAGE_PLANS.pro;
+            const local = UsageTrackerModule.getStats();
+            let html = `<div style="display:flex;justify-content:space-between;font-size:9px;color:#555;margin-bottom:2px">
+                    <span>${plan.name} thresholds</span><span>${local.totalCached} cached sends</span>
+                </div>`;
             const addBar = (label, info) => {
                 if (!info) return;
                 const pct = Math.round((info.utilization || 0) * 100);
@@ -1712,10 +3203,19 @@
                         <div class="${PREFIX}-usage-bar"><div class="${PREFIX}-usage-fill ${cls}" style="width:${pct}%"></div></div>
                     </div>`;
             };
-            addBar('Session (5h)', windows['5h']);
-            addBar('Weekly', windows['7d']);
+            const localLimit = this.LOCAL_USAGE_BASELINE.session * plan.multiplier;
+            const localPct = Math.min(100, Math.round((local.session / localLimit) * 100));
+            const localCls = localPct > 80 ? 'danger' : localPct > 60 ? 'warn' : '';
+            html += `<div style="margin-bottom:3px">
+                    <div style="display:flex;justify-content:space-between;font-size:10px;color:#888">
+                        <span>Tab Session</span><span>${local.session} sends</span>
+                    </div>
+                    <div class="${PREFIX}-usage-bar"><div class="${PREFIX}-usage-fill ${localCls}" style="width:${localPct}%"></div></div>
+                </div>`;
+            addBar('5h Window', windows['5h'] || windows.five_hour);
+            addBar('7d Window', windows['7d'] || windows.seven_day);
             if (html) setHTML(container, html);
-            const session = windows['5h'];
+            const session = windows['5h'] || windows.five_hour;
             if (session) this._updateGearBadge(Math.round((session.utilization || 0) * 100));
         },
 
@@ -1758,6 +3258,63 @@
             });
         },
 
+        _renderConversationSearch(query = '') {
+            const meta = $(`#${PREFIX}-search-meta`);
+            const resultsEl = $(`#${PREFIX}-search-results`);
+            if (!meta || !resultsEl) return;
+            if (!Settings.get('conversationSearch')) {
+                meta.textContent = 'Search disabled';
+                setHTML(resultsEl, '');
+                return;
+            }
+            const results = ConversationSearchModule.search(query, 8);
+            const indexed = ConversationSearchModule.lastIndexed
+                ? new Date(ConversationSearchModule.lastIndexed).toLocaleString('en', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+                : 'never';
+            meta.textContent = `${ConversationSearchModule.items.length} cached - indexed ${indexed}`;
+            if (!results.length) {
+                setHTML(resultsEl, `<div style="font-size:10px;color:#555;padding:3px 0">${query ? 'No matches' : 'No cached conversations'}</div>`);
+                return;
+            }
+            setHTML(resultsEl, results.map(item => {
+                const date = item.updated ? new Date(item.updated).toLocaleDateString('en', { month: 'short', day: 'numeric' }) : '';
+                return `<div class="${PREFIX}-search-result">
+                    <button class="${PREFIX}-tool-btn ${PREFIX}-search-open" data-chat-id="${esc(item.id)}" style="min-width:42px">Open</button>
+                    <span class="${PREFIX}-search-title" title="${esc(item.title)}">${esc(item.title)}</span>
+                    <span class="${PREFIX}-search-date">${esc(date)}</span>
+                </div>`;
+            }).join(''));
+            resultsEl.querySelectorAll('.' + PREFIX + '-search-open').forEach(btn => {
+                btn.addEventListener('click', () => ConversationSearchModule.open(btn.dataset.chatId));
+            });
+        },
+
+        _setSearchLoading(loading) {
+            const btn = $(`#${PREFIX}-search-refresh`);
+            if (!btn) return;
+            btn.disabled = !!loading;
+            btn.textContent = loading ? 'Indexing' : 'Index';
+        },
+
+        _updateVoiceStatus(status) {
+            const el = $(`#${PREFIX}-voice-status`);
+            const btn = $(`#${PREFIX}-voice-toggle`);
+            if (!el || !btn) return;
+            if (status === 'listening') {
+                el.textContent = 'Voice listening';
+                el.style.color = '#3fb950';
+                btn.classList.add('success');
+            } else if (status === 'error') {
+                el.textContent = 'Voice error';
+                el.style.color = '#f85149';
+                btn.classList.remove('success');
+            } else {
+                el.textContent = VoiceDictationModule.isSupported() ? 'Voice idle' : 'Voice unavailable';
+                el.style.color = '#555';
+                btn.classList.remove('success');
+            }
+        },
+
         _renderPrompts() {
             const container = $(`#${PREFIX}-prompt-list`);
             if (!container) return;
@@ -1787,6 +3344,22 @@
             overlay.className = PREFIX + '-modal-overlay';
             const modal = document.createElement('div');
             modal.className = PREFIX + '-modal';
+            const history = existing ? PromptModule.getHistory(existing.id) : [];
+            const historyHTML = history.length > 0 ? `
+                <div style="margin-top:10px;border-top:1px solid #2a2a3a;padding-top:8px">
+                    <span style="font-size:10px;color:#888">Version history (${history.length})</span>
+                    <div style="max-height:80px;overflow-y:auto;margin-top:4px">
+                        ${history.map((h, i) => {
+                            const date = new Date(h.time).toLocaleDateString('en', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+                            const preview = (h.prompt || '').substring(0, 50).replace(/\n/g, ' ');
+                            return `<div style="display:flex;justify-content:space-between;align-items:center;padding:2px 0;font-size:10px">
+                                <span style="color:#888;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">${esc(date)}: ${esc(preview)}...</span>
+                                <button class="${PREFIX}-modal-btn secondary ${PREFIX}-rollback-btn" data-idx="${i}" style="padding:1px 6px;font-size:9px;margin-left:4px;flex-shrink:0">Restore</button>
+                            </div>`;
+                        }).join('')}
+                    </div>
+                </div>
+            ` : '';
             setHTML(modal, `
                 <h3>${existing ? 'Edit' : 'Add'} Prompt</h3>
                 <input id="${PREFIX}-pe-label" placeholder="Button label" value="${existing ? esc(existing.label) : ''}">
@@ -1796,6 +3369,7 @@
                         ${PromptModule.CATEGORIES.map(c => `<option value="${c.id}" ${existing?.cat === c.id ? 'selected' : ''}>${c.label}</option>`).join('')}
                     </select>
                 </div>
+                ${historyHTML}
                 <div class="${PREFIX}-modal-actions">
                     ${existing && !existing.id.startsWith('spec') && !existing.id.startsWith('arch') ? `<button class="${PREFIX}-modal-btn danger" id="${PREFIX}-pe-delete">Delete</button>` : ''}
                     <button class="${PREFIX}-modal-btn secondary" id="${PREFIX}-pe-cancel">Cancel</button>
@@ -1823,6 +3397,17 @@
                 this._renderPrompts();
                 overlay.remove();
                 showToast('Prompt deleted', 2000, 'info');
+            });
+            // Rollback buttons
+            modal.querySelectorAll('.' + PREFIX + '-rollback-btn').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const idx = parseInt(btn.dataset.idx);
+                    if (existing && PromptModule.rollback(existing.id, idx)) {
+                        this._renderPrompts();
+                        overlay.remove();
+                        showToast('Prompt restored from history', 2000, 'success');
+                    }
+                });
             });
         },
 
@@ -1865,6 +3450,84 @@
             advEl.style.color = { good: '#3fb950', warn: '#d29922', critical: '#f85149' }[h.level];
         },
 
+        _updateCache(status) {
+            const el = $(`#${PREFIX}-cache-indicator`);
+            if (!el) return;
+            if (status === 'hit') {
+                el.style.color = '#3fb950';
+                el.textContent = 'Cache: HIT';
+            } else if (status === 'miss') {
+                el.style.color = '#555';
+                el.textContent = 'Cache: miss';
+            } else if (status === 'expired') {
+                el.style.color = '#d29922';
+                el.textContent = 'Cache: expired';
+            }
+        },
+
+        _updateCacheTimer(d) {
+            const el = $(`#${PREFIX}-cache-indicator`);
+            if (!el) return;
+            const mins = Math.floor(d.remaining / 60);
+            const secs = Math.floor(d.remaining % 60);
+            el.style.color = d.remaining < 60 ? '#d29922' : '#3fb950';
+            el.textContent = `Cache: HIT (${mins}:${String(secs).padStart(2, '0')} left)`;
+        },
+
+        _updateCost(d) {
+            const el = $(`#${PREFIX}-cost-display`);
+            if (!el) return;
+            const total = d.sessionCost;
+            const fmt = total < 0.01 ? '$' + total.toFixed(4) : '$' + total.toFixed(3);
+            el.textContent = fmt + ' (' + d.model + ')';
+        },
+
+        _renderErrorLog() {
+            const el = $(`#${PREFIX}-error-log`);
+            if (el) setHTML(el, ErrorLogModule.getHTML());
+        },
+
+        _updateTurnNav() {
+            const container = $(`#${PREFIX}-turn-nav`);
+            if (!container) return;
+            const main = document.querySelector('main');
+            if (!main) { setHTML(container, '<span style="color:#555;font-size:10px">No conversation</span>'); return; }
+            const groups = $$(SEL.msgGroup, main);
+            const messages = getConversationMessages();
+            if (groups.length === 0 || messages.length === 0) { setHTML(container, '<span style="color:#555;font-size:10px">No messages</span>'); return; }
+            let html = '';
+            messages.forEach((m) => {
+                const preview = m.text.substring(0, 40).replace(/\n/g, ' ');
+                const role = m.role === 'human' ? 'H' : 'A';
+                const roleClass = m.role === 'human' ? 'human' : 'ai';
+                html += `<div class="${PREFIX}-turn-item" data-turn-idx="${m.index}">` +
+                    `<span class="turn-role ${roleClass}">${role}</span>` +
+                    `<span class="turn-preview">${esc(preview || '...')}</span>` +
+                    `<button class="${PREFIX}-turn-fork" data-fork-idx="${m.index}" title="Fork through this turn">F</button></div>`;
+            });
+            setHTML(container, html);
+            container.querySelectorAll('.' + PREFIX + '-turn-item').forEach(item => {
+                item.addEventListener('click', () => {
+                    const idx = parseInt(item.dataset.turnIdx);
+                    const target = groups[idx];
+                    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                });
+            });
+            container.querySelectorAll('.' + PREFIX + '-turn-fork').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    ForkConversationModule.forkAt(parseInt(btn.dataset.forkIdx));
+                });
+            });
+        },
+
+        _jumpTurn(delta) {
+            const groups = $$(SEL.msgGroup, document.querySelector('main') || document);
+            if (!groups.length) return;
+            this._turnCursor = Math.max(0, Math.min(groups.length - 1, this._turnCursor + delta));
+            groups[this._turnCursor].scrollIntoView({ behavior: 'smooth', block: 'start' });
+        },
+
         _updateGearBadge(pct) {
             // Update hover strip indicator color based on usage
             const strip = $(`#${PREFIX}-hover-strip`);
@@ -1896,18 +3559,15 @@
             let hideTimeout = null;
             const showPanel = () => {
                 clearTimeout(hideTimeout);
-                if (this._panel && this._panel.classList.contains(PREFIX + '-panel-hidden')) {
-                    this._panel.classList.remove(PREFIX + '-panel-hidden');
-                    this._panel.style.pointerEvents = 'auto';
-                    this._visible = true;
-                }
+                this.show();
             };
             const scheduleHide = () => {
+                if (Settings.get('panelPinned')) return;
                 clearTimeout(hideTimeout);
                 hideTimeout = setTimeout(() => {
+                    if (Settings.get('panelPinned')) return;
                     if (this._panel && !this._panel.matches(':hover') && !strip.matches(':hover')) {
-                        this._panel.classList.add(PREFIX + '-panel-hidden');
-                        this._visible = false;
+                        this.hide();
                     }
                 }, 400);
             };
@@ -1927,10 +3587,23 @@
     //  INITIALIZATION
     // =====================================================================
     const ALL_MODULES = [
-        ThemeModule, LayoutModule, VisualModule, PasteFixModule,
-        AutoScrollModule, AutoApproveModule, ContextModule,
-        ResponseModule, DomTrimmerModule, PromptModule, ShortcutsModule
+        ThemeModule, FocusModule, DensityModule, LayoutModule, VisualModule, PasteFixModule,
+        AutoScrollModule, AutoApproveModule, UsageTrackerModule, ContextModule, CacheModule, CostModule,
+        ResponseModule, DomTrimmerModule, CodeFoldModule, CopyTurnModule,
+        ErrorLogModule, RetitleModule, ConversationSearchModule, VoiceDictationModule,
+        ForkConversationModule, SnippetModule, PromptModule, PanelToolsModule
     ];
+
+    // Safe module initializer — isolates each module so one failure
+    // doesn't take down the rest (graceful degradation).
+    function safeInit(mod) {
+        try {
+            mod.init();
+        } catch (e) {
+            console.error(LOG_TAG, `Module "${mod.id}" failed to init:`, e);
+            EventBus.emit('module:error', { module: mod.id, error: e });
+        }
+    }
 
     async function init() {
         console.log(`%c${LOG_TAG} Claude Ultimate Enhancer v${VERSION} initializing...`, 'color:#58a6ff;font-weight:bold;font-size:14px');
@@ -1938,15 +3611,16 @@
         // Install fetch interceptor early (before any fetches)
         StreamMonitor.install();
 
-        // Init modules that work at document-start
-        ThemeModule.init();
-        LayoutModule.init();
-        PasteFixModule.init();
+        // Error log must init first to capture other module errors
+        safeInit(ErrorLogModule);
 
-        // DevTools shortcut fix
-        document.addEventListener('keydown', (e) => {
-            if (e.ctrlKey && e.shiftKey && e.key === 'I') e.stopImmediatePropagation();
-        }, true);
+        // Init modules that work at document-start
+        safeInit(ThemeModule);
+        safeInit(FocusModule);
+        safeInit(DensityModule);
+        safeInit(LayoutModule);
+        safeInit(PasteFixModule);
+        safeInit(UsageTrackerModule);
 
         // Wait for body to be available
         const waitBody = () => new Promise(r => {
@@ -1956,15 +3630,24 @@
         });
         await waitBody();
 
-        // Init remaining modules
-        VisualModule.init();
-        AutoScrollModule.init();
-        AutoApproveModule.init();
-        ContextModule.init();
-        ResponseModule.init();
-        DomTrimmerModule.init();
-        PromptModule.init();
-        ShortcutsModule.init();
+        // Init remaining modules with graceful degradation
+        safeInit(VisualModule);
+        safeInit(AutoScrollModule);
+        safeInit(AutoApproveModule);
+        safeInit(ContextModule);
+        safeInit(CacheModule);
+        safeInit(CostModule);
+        safeInit(ResponseModule);
+        safeInit(DomTrimmerModule);
+        safeInit(CodeFoldModule);
+        safeInit(CopyTurnModule);
+        safeInit(RetitleModule);
+        safeInit(ConversationSearchModule);
+        safeInit(VoiceDictationModule);
+        safeInit(ForkConversationModule);
+        safeInit(SnippetModule);
+        safeInit(PromptModule);
+        safeInit(PanelToolsModule);
 
         // Build control panel
         ControlPanel.build();
@@ -1987,7 +3670,7 @@
             }
         }, 2000);
 
-        console.log(`%c${LOG_TAG} Ready! Hover right edge or press Ctrl+Shift+D`, 'color:#3fb950;font-weight:bold');
+        console.log(`%c${LOG_TAG} Ready! Hover right edge to open the panel`, 'color:#3fb950;font-weight:bold');
     }
 
     // Start

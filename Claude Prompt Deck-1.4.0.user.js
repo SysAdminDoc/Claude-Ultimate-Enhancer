@@ -3,7 +3,7 @@
 // @namespace    https://github.com/SysAdminDoc
 // @version      1.4.0
 // @description  Sliding sidebar for Claude.ai - prompt templates, context tracking, auto-scroll, auto-approve, response timer, notifications, keyboard shortcuts
-// @author       SysAdminDoc + Claude
+// @author       SysAdminDoc
 // @match        https://claude.ai/*
 // @run-at       document-idle
 // @grant        none
@@ -196,7 +196,7 @@ End with: \`STATUS: FEATURES COMPLETE\``
             id: 'branding', label: 'Branding', cat: 'pipeline',
             prompt: `AUTOPILOT: **BRANDING PHASE**
 
-1. **AI Logo Prompt** - Detailed prompt for DALL-E 3 / Midjourney / Stable Diffusion to generate a professional logo
+1. **Logo Prompt** - Detailed prompt for DALL-E 3 / Midjourney / Stable Diffusion to generate a professional logo
 2. **Color Palette** - 5-6 hex codes with names and usage
 3. **Tagline** - One-line project description
 4. **Icon Concepts** - 2-3 favicon/app icon ideas
@@ -413,49 +413,6 @@ End with: \`STATUS: ANALYSIS COMPLETE\``
             const btn = document.getElementById('cpd-copy-resp');
             if (btn) { btn.textContent = 'OK!'; btn.style.color = '#3fb950'; setTimeout(() => { btn.textContent = 'Copy'; btn.style.color = ''; }, 1200); }
         });
-    }
-
-    // ---- Keyboard Shortcuts ----
-    function setupKeyboardShortcuts() {
-        document.addEventListener('keydown', (e) => {
-            // Don't fire if user is typing in an input/textarea/contenteditable
-            const tag = (e.target.tagName || '').toLowerCase();
-            const editable = e.target.isContentEditable || tag === 'input' || tag === 'textarea';
-            // Allow Ctrl+Shift combos even in editors (they're unusual enough)
-            if (!e.ctrlKey || !e.shiftKey) { if (editable) return; }
-            if (!e.ctrlKey || !e.shiftKey) return;
-
-            switch (e.key.toUpperCase()) {
-                case 'D': // Toggle sidebar
-                    e.preventDefault();
-                    if (sidebarOpen) closeSidebar(); else openSidebar();
-                    break;
-                case 'L': // Toggle lock
-                    e.preventDefault();
-                    if (!sidebarOpen) openSidebar();
-                    toggleLock(); updateHandleLockState();
-                    break;
-                case 'K': // Copy last code block
-                    e.preventDefault();
-                    const blocks = scanCodeBlocks();
-                    if (blocks.length > 0) {
-                        const last = blocks[blocks.length - 1];
-                        navigator.clipboard.writeText(last.text).then(() => {
-                            log('Hotkey: Copied last code block (' + last.lang + ', ' + last.lines + 'L)', 'success');
-                        }).catch(() => {});
-                    } else { log('Hotkey: No code blocks to copy', 'warn'); }
-                    break;
-                case 'C': // Copy last response (only with Ctrl+Shift, so won't conflict with normal copy)
-                    // Only if no text selected (don't override normal Ctrl+Shift+C in some terminals)
-                    if (window.getSelection().toString().length === 0) { e.preventDefault(); copyLastResponse(); }
-                    break;
-                case 'E': // Export chat as markdown
-                    e.preventDefault();
-                    exportChatMarkdown();
-                    break;
-            }
-        });
-        log('Keyboard shortcuts active (Ctrl+Shift+D/L/K/C/E)', 'info');
     }
 
     // ---- Quick Export ----
@@ -1149,7 +1106,7 @@ End with: \`STATUS: ANALYSIS COMPLETE\``
         const timer = mkEl('span', 'cpd-timer'); timer.id = 'cpd-timer'; timer.textContent = '--'; timer.style.color = '#484f58'; timer.title = 'Response time';
         hdrR.appendChild(timer);
         // Copy last response button
-        const copyResp = mkEl('button', 'cpd-copy-resp'); copyResp.id = 'cpd-copy-resp'; copyResp.textContent = 'Copy'; copyResp.title = 'Copy last Claude response (Ctrl+Shift+C)';
+        const copyResp = mkEl('button', 'cpd-copy-resp'); copyResp.id = 'cpd-copy-resp'; copyResp.textContent = 'Copy'; copyResp.title = 'Copy last Claude response';
         copyResp.addEventListener('click', copyLastResponse);
         hdrR.appendChild(copyResp);
         const statSpan = mkEl('span'); statSpan.id = 'cpd-stat-mini'; statSpan.textContent = 'idle';
@@ -1245,7 +1202,7 @@ End with: \`STATUS: ANALYSIS COMPLETE\``
 
         // Footer
         const foot = mkEl('div', 'cpd-foot');
-        foot.innerHTML = 'Hover = open &bull; Click handle = lock &bull; <b>Ctrl+Shift</b>: D sidebar, L lock, K copy code, C copy response, E export';
+        foot.innerHTML = 'Hover = open &bull; Click handle = lock';
         panel.appendChild(foot);
 
         document.body.appendChild(panel);
@@ -1257,7 +1214,6 @@ End with: \`STATUS: ANALYSIS COMPLETE\``
         setupFetchInterceptor();
         setupAutoScroll();
         setupAutoApprove();
-        setupKeyboardShortcuts();
         startMonitor();
         countConversationMetrics();
         refreshCodeBlocks();

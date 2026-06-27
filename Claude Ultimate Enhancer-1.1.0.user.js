@@ -82,8 +82,6 @@
             responseMonitor: true,
             notifySound: true,
             notifyFlash: true,
-            // -- Keyboard Shortcuts --
-            shortcuts: true,
             // -- Paste Fix --
             pasteFix: true,
             // -- Panel --
@@ -1015,7 +1013,7 @@
             { id: 'testing', label: 'Testing', cat: 'pipeline', prompt: `AUTOPILOT: **TESTING PHASE**\n\nGenerate comprehensive test suite:\n1. **Unit Tests** - Each function/method independently\n2. **Integration Tests** - Component interactions\n3. **Edge Cases** - Boundary values, empty/malformed inputs\n4. **Error Paths** - Verify error handling works\n5. **Smoke Tests** - End-to-end happy path\n\nUse appropriate framework. Single-command runnable.\n\nEnd with: \`STATUS: TESTING COMPLETE\`` },
             { id: 'final_audit', label: 'Final Audit', cat: 'pipeline', prompt: `AUTOPILOT: **FINAL AUDIT**\n\nComplete final review:\n1. **Code Quality** - Dead code, duplication, complexity\n2. **Security** - SQL injection, XSS, path traversal, hardcoded secrets, input validation\n3. **Completeness** - Compare against original spec\n4. **Performance** - Bottlenecks, N+1 queries, unbounded loops\n5. **Error Messages** - Helpful and user-friendly?\n6. **Documentation** - Functions documented? README complete?\n7. **Dependencies** - All packages real and necessary?\n8. **Cross-platform** - Works on Win/macOS/Linux?\n\nFix everything. Show corrected code.\n\nEnd with: \`STATUS: FINAL_AUDIT COMPLETE\`` },
             { id: 'features', label: 'Features', cat: 'pipeline', prompt: `AUTOPILOT: **FEATURE ENHANCEMENT**\n\nAdd polish:\n1. Edge cases not yet handled\n2. UX/DX improvements - progress bars, colors, formatting\n3. Configuration - make hardcoded values configurable\n4. Logging - structured with levels\n5. Help/usage - --help, usage examples\n6. Graceful degradation - missing deps, network failures\n7. Performance - caching, lazy loading where applicable\n\nImplement all with complete code.\n\nEnd with: \`STATUS: FEATURES COMPLETE\`` },
-            { id: 'branding', label: 'Branding', cat: 'pipeline', prompt: `AUTOPILOT: **BRANDING PHASE**\n\n1. **AI Logo Prompt** - Detailed prompt for DALL-E 3 / Midjourney / Stable Diffusion to generate a professional logo\n2. **Color Palette** - 5-6 hex codes with names and usage\n3. **Tagline** - One-line project description\n4. **Icon Concepts** - 2-3 favicon/app icon ideas\n5. **ASCII Banner** - For CLI/README\n\nEnd with: \`STATUS: BRANDING COMPLETE\`` },
+            { id: 'branding', label: 'Branding', cat: 'pipeline', prompt: `AUTOPILOT: **BRANDING PHASE**\n\n1. **Logo Prompt** - Detailed prompt for DALL-E 3 / Midjourney / Stable Diffusion to generate a professional logo\n2. **Color Palette** - 5-6 hex codes with names and usage\n3. **Tagline** - One-line project description\n4. **Icon Concepts** - 2-3 favicon/app icon ideas\n5. **ASCII Banner** - For CLI/README\n\nEnd with: \`STATUS: BRANDING COMPLETE\`` },
             { id: 'packaging', label: 'Packaging', cat: 'pipeline', prompt: `AUTOPILOT: **PACKAGING PHASE**\n\n1. **Standalone Executable** - Best tool for language (PyInstaller/pkg/nexe/go build), build script, config, icon, metadata, one-command build\n2. **Portable Executable** - No install, runs from USB, self-contained, portable config\n3. **Build README** - Steps, prerequisites, troubleshooting\n4. **Release Script** - Automated build + package + hash\n\nEnd with: \`STATUS: PACKAGING COMPLETE\`` },
             { id: 'summary', label: 'Summary', cat: 'pipeline', prompt: `AUTOPILOT: **FINAL SUMMARY**\n\n1. **File Manifest** - Every file, purpose, path\n2. **Quick Start** - 3 steps or fewer\n3. **Full Setup** - All platforms\n4. **Usage Guide** - Commands, flags, config, examples\n5. **Build Guide** - Standalone + portable compilation\n6. **Architecture Diagram** - ASCII component diagram\n7. **Tech Stack** - Languages, frameworks, tools, versions\n8. **Known Limitations** - Honest assessment\n9. **Future Roadmap** - Suggested next features\n\nEnd with: \`STATUS: PROJECT COMPLETE\`` },
             { id: 'continue', label: 'Continue', cat: 'recovery', prompt: 'CONTINUE - Your response was cut off. Pick up EXACTLY where you stopped. Do not repeat anything.' },
@@ -1204,33 +1202,12 @@
     }
 
     // =====================================================================
-    //  MODULE: KEYBOARD SHORTCUTS
+    //  MODULE: PANEL TOOLS
     // =====================================================================
-    const ShortcutsModule = {
-        id: 'shortcuts',
-        _handler: null,
+    const PanelToolsModule = {
+        id: 'panelTools',
 
-        init() {
-            this._handler = (e) => {
-                if (!Settings.get('shortcuts')) return;
-                // Allow Ctrl+Shift combos even in editors (they're unusual enough)
-                const tag = (e.target.tagName || '').toLowerCase();
-                const editable = e.target.isContentEditable || tag === 'input' || tag === 'textarea';
-                if (!e.ctrlKey || !e.shiftKey) { if (editable) return; }
-                if (!e.ctrlKey || !e.shiftKey) return;
-
-                switch (e.key.toUpperCase()) {
-                    case 'D': e.preventDefault(); ControlPanel.toggle(); break;
-                    case 'K': e.preventDefault(); this._copyLastCode(); break;
-                    case 'C':
-                        // Only if no text selected (don't override normal Ctrl+Shift+C)
-                        if (window.getSelection().toString().length === 0) { e.preventDefault(); this._copyLastResponse(); }
-                        break;
-                    case 'E': e.preventDefault(); this._exportChat(); break;
-                }
-            };
-            document.addEventListener('keydown', this._handler, true);
-        },
+        init() {},
 
         _copyLastCode() {
             const blocks = scanCodeBlocks();
@@ -1276,9 +1253,7 @@
             showToast('Chat exported!', 2000, 'success');
         },
 
-        destroy() {
-            if (this._handler) document.removeEventListener('keydown', this._handler, true);
-        }
+        destroy() {}
     };
 
     // =====================================================================
@@ -1499,13 +1474,6 @@
                 .${PREFIX}-modal-btn.danger { background: transparent; color: #f85149; border-color: rgba(248,81,73,0.3); }
                 .${PREFIX}-modal-btn.danger:hover { background: rgba(248,81,73,0.1); }
 
-                /* Shortcut keys */
-                .${PREFIX}-shortcut-hint {
-                    display: inline-block; padding: 0px 4px; background: rgba(255,255,255,0.06);
-                    border: 1px solid rgba(255,255,255,0.1); border-radius: 3px;
-                    font-size: 9px; color: #666; font-family: monospace;
-                }
-
                 /* Settings grid for two-column layout */
                 .${PREFIX}-settings-grid {
                     display: grid; grid-template-columns: 1fr 1fr; gap: 0 6px;
@@ -1588,12 +1556,6 @@
                 </div>
 
                 <div class="${PREFIX}-section" style="border-bottom:none">
-                    <div style="display:grid;grid-template-columns:auto 1fr;gap:1px 8px;font-size:9px;color:#555">
-                        <span class="${PREFIX}-shortcut-hint">Ctrl+Shift+D</span><span>Panel</span>
-                        <span class="${PREFIX}-shortcut-hint">Ctrl+Shift+K</span><span>Copy code</span>
-                        <span class="${PREFIX}-shortcut-hint">Ctrl+Shift+C</span><span>Copy resp</span>
-                        <span class="${PREFIX}-shortcut-hint">Ctrl+Shift+E</span><span>Export</span>
-                    </div>
                     <div style="text-align:center;margin-top:3px"><span style="cursor:pointer;color:#58a6ff;font-size:9px" id="${PREFIX}-reset-settings">Reset All</span></div>
                 </div>
             `;
@@ -1641,7 +1603,7 @@
 
             // Reset settings
             $(`#${PREFIX}-reset-settings`).addEventListener('click', () => {
-                if (confirm('Reset all settings to defaults?')) { Settings.reset(); location.reload(); }
+                Settings.reset(); showToast('Settings reset', 1200, 'success'); setTimeout(() => location.reload(), 600);
             });
 
             // Add prompt button
@@ -1929,7 +1891,7 @@
     const ALL_MODULES = [
         ThemeModule, LayoutModule, VisualModule, PasteFixModule,
         AutoScrollModule, AutoApproveModule, ContextModule,
-        ResponseModule, DomTrimmerModule, PromptModule, ShortcutsModule
+        ResponseModule, DomTrimmerModule, PromptModule, PanelToolsModule
     ];
 
     async function init() {
@@ -1942,11 +1904,6 @@
         ThemeModule.init();
         LayoutModule.init();
         PasteFixModule.init();
-
-        // DevTools shortcut fix
-        document.addEventListener('keydown', (e) => {
-            if (e.ctrlKey && e.shiftKey && e.key === 'I') e.stopImmediatePropagation();
-        }, true);
 
         // Wait for body to be available
         const waitBody = () => new Promise(r => {
@@ -1964,7 +1921,7 @@
         ResponseModule.init();
         DomTrimmerModule.init();
         PromptModule.init();
-        ShortcutsModule.init();
+        PanelToolsModule.init();
 
         // Build control panel
         ControlPanel.build();
@@ -1987,7 +1944,7 @@
             }
         }, 2000);
 
-        console.log(`%c${LOG_TAG} Ready! Hover right edge or press Ctrl+Shift+D`, 'color:#3fb950;font-weight:bold');
+        console.log(`%c${LOG_TAG} Ready! Hover right edge to open the panel`, 'color:#3fb950;font-weight:bold');
     }
 
     // Start
