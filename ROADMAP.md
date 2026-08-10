@@ -1,10 +1,8 @@
 # Claude Ultimate Enhancer (CUE) — Roadmap
 
-All-in-one claude.ai userscript: theme engine, usage monitor, prompt library, auto-scroll, DOM trimmer, visual upgrades, settings panel.
+Actionable work only. Historical and completed roadmap material is archived in CHANGELOG.md; blocked work is kept in Roadmap_Blocked.md.
 
-No remaining actionable roadmap items.
-
-## Research-Driven Additions
+## Actionable Items
 
 - [ ] P0 - Branch-aware conversation export with metadata
   Why: Current export is DOM-current only and competitors preserve branches, model/timestamp metadata, and failure summaries.
