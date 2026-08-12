@@ -1,0 +1,12 @@
+{
+  "name": "claude-ultimate-enhancer",
+  "private": true,
+  "version": "1.3.0",
+  "description": "Local contract tests for the Claude Ultimate Enhancer userscript",
+  "scripts": {
+    "test": "node --test tests/cue.test.cjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

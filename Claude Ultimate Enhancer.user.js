@@ -14,12 +14,16 @@
 // @grant        GM_addStyle
 // @run-at       document-start
 // @inject-into  content
+// @noframes
 // @license      MIT
 // ==/UserScript==
 
 (function () {
     'use strict';
 
+    // @match applies to frames unless the manager honors @noframes. Keep the
+    // runtime guard as the defense-in-depth boundary for both managers.
+    try { if (window.top !== window.self) return; } catch (e) { return; }
     if (window.__claudeUltimateLoaded) return;
     window.__claudeUltimateLoaded = true;
 
@@ -28,18 +32,46 @@
     const LOG_TAG = '[CUE]';
 
     // =====================================================================
-    //  TRUSTED TYPES (claude.ai sets require-trusted-types-for 'script' on
-    //  some routes — without a policy, every innerHTML assignment throws.)
+    //  TRUSTED TYPES / HTML SAFETY
     // =====================================================================
+    // CUE renders its own compact templates, but conversation/config values
+    // can reach the same sinks. Keep the policy non-identity and strip the
+    // executable parts before a string ever reaches innerHTML.
+    const UNSAFE_TAG_RE = /<\s*\/?\s*(?:script|iframe|object|embed|base|meta|link|svg|math|style)\b[^>]*>/gi;
+    const EVENT_ATTR_RE = /\s+on[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi;
+    const UNSAFE_ATTR_RE = /\s+(?:srcdoc|formaction|xlink:href)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi;
+    const URL_ATTR_RE = /\s+(href|src|action)\s*=\s*("|')([\s\S]*?)\2/gi;
+
+    function sanitizeMarkup(html) {
+        let safe = String(html ?? '')
+            .replace(/<!--[\s\S]*?-->/g, '')
+            .replace(/<\s*(?:script|iframe|object|embed|base|meta|link|svg|math|style)\b[\s\S]*?<\s*\/\s*(?:script|iframe|object|embed|base|meta|link|svg|math|style)\s*>/gi, '')
+            .replace(UNSAFE_TAG_RE, '')
+            .replace(EVENT_ATTR_RE, '')
+            .replace(UNSAFE_ATTR_RE, '')
+            .replace(URL_ATTR_RE, (match, name, quote, value) => {
+                const normalized = String(value).trim().toLowerCase();
+                return /^(?:javascript:|vbscript:|data:text\/html|data:application\/javascript)/i.test(normalized)
+                    ? ''
+                    : match;
+            });
+        // Unquoted dangerous URLs are uncommon in CUE templates, but remove
+        // them too so a malformed imported value cannot bypass the quoted rule.
+        safe = safe.replace(/\s+(?:href|src|action)\s*=\s*(?:javascript:|vbscript:|data:text\/html|data:application\/javascript)[^\s>]+/gi, '');
+        return safe;
+    }
+
     let _ttPolicy = null;
     try {
         if (window.trustedTypes && window.trustedTypes.createPolicy) {
-            _ttPolicy = window.trustedTypes.createPolicy(PREFIX + '-html', { createHTML: s => s });
+            _ttPolicy = window.trustedTypes.createPolicy(PREFIX + '-html', { createHTML: sanitizeMarkup });
         }
     } catch (e) { /* policy already exists or TT disabled */ }
+
     function setHTML(el, html) {
         if (!el) return;
-        el.innerHTML = _ttPolicy ? _ttPolicy.createHTML(html) : html;
+        const safe = sanitizeMarkup(html);
+        el.innerHTML = _ttPolicy ? _ttPolicy.createHTML(safe) : safe;
     }
 
     // =====================================================================
@@ -47,6 +79,8 @@
     // =====================================================================
     const Settings = {
         _cache: {},
+        _loaded: false,
+        STORAGE_KEY: PREFIX + '_settings',
         _defaults: {
             // -- Theme --
             themeEnabled: true,
@@ -103,17 +137,81 @@
             panelPinned: false,
             panelWidth: 320,
         },
+        _rules: {
+            themeEnabled: 'boolean', fontOverride: 'boolean', wideMode: 'boolean', coloredButtons: 'boolean',
+            coloredBoldItalic: 'boolean', smoothAnimations: 'boolean', customScrollbar: 'boolean', pasteFix: 'boolean',
+            autoScroll: 'boolean', autoApprove: 'boolean', contextTracker: 'boolean', responseMonitor: 'boolean',
+            notifySound: 'boolean', notifyFlash: 'boolean', codeFold: 'boolean', copyTurn: 'boolean',
+            snippetTrigger: 'boolean', conversationSearch: 'boolean', forkConversation: 'boolean', voiceDictation: 'boolean',
+            promptLibrary: 'boolean', usageMonitor: 'boolean', featureToggles: 'boolean', domTrimmer: 'boolean',
+            focusMode: 'boolean', panelPinned: 'boolean',
+            themeVariant: ['oceanic', 'midnight', 'mocha', 'macchiato', 'frappe', 'latte', 'none'],
+            usagePlan: ['pro', 'max5', 'max20'],
+            densityMode: ['comfortable', 'compact', 'reading'],
+            panelPosition: ['bottom-right', 'top-right', 'bottom-left', 'top-left'],
+            chatWidthPct: { min: 50, max: 100, integer: true },
+            usageFetchInterval: { min: 30, max: 3600, integer: true },
+            domKeepVisible: { min: 5, max: 100, integer: true },
+            contextWindow: { min: 1000, max: 10000000, integer: true },
+            warnThreshold: { min: 0, max: 1 },
+            criticalThreshold: { min: 0, max: 1 },
+            panelWidth: { min: 280, max: 640, integer: true },
+        },
+        _isValid(key, value) {
+            if (!(key in this._defaults)) return false;
+            const rule = this._rules[key];
+            if (rule === 'boolean') return typeof value === 'boolean';
+            if (Array.isArray(rule)) return typeof value === 'string' && rule.includes(value);
+            if (rule && typeof rule === 'object') {
+                return typeof value === 'number' && Number.isFinite(value) && value >= rule.min && value <= rule.max && (!rule.integer || Number.isInteger(value));
+            }
+            return typeof value === typeof this._defaults[key];
+        },
+        _load() {
+            if (this._loaded) return;
+            const stored = StorageRepository.read(this.STORAGE_KEY, {}, {
+                version: 1,
+                maxBytes: 64 * 1024,
+                validate: value => value && typeof value === 'object' && !Array.isArray(value),
+                migrate: (value) => value?.settings && typeof value.settings === 'object' ? value.settings : value
+            });
+            const legacy = {};
+            Object.keys(this._defaults).forEach(key => {
+                if (Object.prototype.hasOwnProperty.call(stored, key) && this._isValid(key, stored[key])) return;
+                try {
+                    const value = GM_getValue(PREFIX + '_' + key, undefined);
+                    if (value !== undefined && this._isValid(key, value)) legacy[key] = value;
+                } catch (e) { /* use default */ }
+            });
+            this._cache = {};
+            Object.keys(this._defaults).forEach(key => {
+                const value = Object.prototype.hasOwnProperty.call(stored, key) && this._isValid(key, stored[key])
+                    ? stored[key]
+                    : Object.prototype.hasOwnProperty.call(legacy, key) ? legacy[key] : this._defaults[key];
+                this._cache[key] = value;
+            });
+            this._loaded = true;
+            if (!Object.keys(stored).length || Object.keys(legacy).length) StorageRepository.write(this.STORAGE_KEY, this._cache, { version: 1, maxBytes: 64 * 1024 });
+        },
         get(key) {
-            if (key in this._cache) return this._cache[key];
-            const val = GM_getValue(PREFIX + '_' + key, this._defaults[key]);
-            this._cache[key] = val;
-            return val;
+            this._load();
+            return key in this._cache ? this._cache[key] : undefined;
         },
         set(key, val) {
+            this._load();
+            if (!this._isValid(key, val)) {
+                StorageRepository._emit('warn', 'rejected invalid setting value', this.STORAGE_KEY);
+                return false;
+            }
+            const previous = this._cache[key];
             this._cache[key] = val;
-            GM_setValue(PREFIX + '_' + key, val);
+            if (!StorageRepository.write(this.STORAGE_KEY, this._cache, { version: 1, maxBytes: 64 * 1024 })) {
+                this._cache[key] = previous;
+                return false;
+            }
             EventBus.emit('setting:' + key, val);
             EventBus.emit('settings:changed', { key, val });
+            return true;
         },
         toggle(key) {
             const v = !this.get(key);
@@ -122,7 +220,61 @@
         },
         defaults() { return { ...this._defaults }; },
         reset() {
-            Object.keys(this._defaults).forEach(k => this.set(k, this._defaults[k]));
+            this._load();
+            this._cache = { ...this._defaults };
+            StorageRepository.write(this.STORAGE_KEY, this._cache, { version: 1, maxBytes: 64 * 1024 });
+            Object.keys(this._defaults).forEach(k => {
+                EventBus.emit('setting:' + k, this._defaults[k]);
+                EventBus.emit('settings:changed', { key: k, val: this._defaults[k] });
+            });
+        }
+    };
+
+    const ConfigCodec = {
+        SCHEMA: 1,
+        MAX_BYTES: 512 * 1024,
+
+        create() {
+            const settings = {};
+            Object.keys(Settings._defaults).forEach(key => { settings[key] = Settings.get(key); });
+            return {
+                format: 'claude-ultimate-enhancer-config',
+                schema: this.SCHEMA,
+                version: VERSION,
+                exported: new Date().toISOString(),
+                settings,
+                prompts: PromptModule.prompts.map(p => ({ id: p.id, label: p.label, prompt: p.prompt, cat: p.cat, history: p.history || [] }))
+            };
+        },
+
+        parse(text) {
+            if (typeof text !== 'string' || text.length > this.MAX_BYTES) throw new Error('Config exceeds 512 KB');
+            let raw;
+            try { raw = JSON.parse(text); } catch (e) { throw new Error('Malformed JSON'); }
+            if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('Config must be a JSON object');
+            const schema = raw.schema === undefined ? 0 : raw.schema;
+            if (schema !== 0 && schema !== this.SCHEMA) throw new Error('Unsupported config schema: ' + schema);
+            const sourceSettings = schema === 0 ? raw : raw.settings;
+            if (!sourceSettings || typeof sourceSettings !== 'object' || Array.isArray(sourceSettings)) throw new Error('Missing settings object');
+            const acceptedSettings = {};
+            const rejected = [];
+            Object.keys(Settings._defaults).forEach(key => {
+                if (!Object.prototype.hasOwnProperty.call(sourceSettings, key)) return;
+                if (Settings._isValid(key, sourceSettings[key])) acceptedSettings[key] = sourceSettings[key];
+                else rejected.push('setting:' + key);
+            });
+            const promptSource = schema === 0 ? raw._prompts : raw.prompts;
+            const acceptedPrompts = [];
+            if (promptSource !== undefined) {
+                if (!Array.isArray(promptSource) || promptSource.length > 500) rejected.push('prompts');
+                else promptSource.forEach((prompt, index) => {
+                    const normalized = PromptModule._normalize(prompt);
+                    if (normalized) acceptedPrompts.push(normalized);
+                    else rejected.push('prompt[' + index + ']');
+                });
+            }
+            if (!Object.keys(acceptedSettings).length && !acceptedPrompts.length) throw new Error('Config contains no valid settings or prompts');
+            return { schema, settings: acceptedSettings, prompts: acceptedPrompts, rejected };
         }
     };
 
@@ -152,7 +304,7 @@
     const $ = (sel, ctx = document) => ctx.querySelector(sel);
     const $$ = (sel, ctx = document) => [...ctx.querySelectorAll(sel)];
     const sleep = ms => new Promise(r => setTimeout(r, ms));
-    const esc = s => s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+    const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
     const fmtNum = n => n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'K' : String(n);
     const fmtDur = ms => {
         const s = Math.floor(ms / 1000), m = Math.floor(s / 60), h = Math.floor(m / 60);
@@ -263,6 +415,24 @@
         return (clone.innerText || clone.textContent || '').trim();
     }
 
+    function getSafeElementHTML(el) {
+        if (!el) return '';
+        const clone = el.cloneNode(true);
+        clone.querySelectorAll('[class^="' + PREFIX + '-"], [class*=" ' + PREFIX + '-"], [id^="' + PREFIX + '-"], [data-cue-styled], [data-cue-trimmed]').forEach(node => node.remove());
+        clone.querySelectorAll('*').forEach(node => {
+            [...node.attributes].forEach(attr => {
+                const name = attr.name.toLowerCase();
+                const value = String(attr.value || '').trim().toLowerCase();
+                if (name.startsWith('on') || ['srcdoc', 'formaction', 'xlink:href'].includes(name) ||
+                    (['href', 'src', 'action'].includes(name) && /^(?:javascript:|vbscript:|data:text\/html|data:application\/javascript)/i.test(value))) {
+                    node.removeAttribute(attr.name);
+                }
+            });
+            if (/^(SCRIPT|IFRAME|OBJECT|EMBED|BASE|META|LINK|SVG|MATH|STYLE)$/.test(node.tagName)) node.remove();
+        });
+        return sanitizeMarkup(clone.innerHTML);
+    }
+
     function getConversationMessages(maxIndex = null) {
         const main = document.querySelector('main');
         if (!main) return [];
@@ -277,7 +447,8 @@
                 index: i,
                 role: group.querySelector(SEL.userMsg) ? 'human' : 'assistant',
                 text,
-                html: group.innerHTML
+                html: getSafeElementHTML(group),
+                id: group.dataset?.messageId || group.dataset?.id || `turn-${i}`
             });
         }
         return messages;
@@ -288,17 +459,215 @@
         return match ? match[1] : null;
     }
 
+    function cloneJSON(value) {
+        try { return JSON.parse(JSON.stringify(value)); } catch (e) { return null; }
+    }
+
+    function messageTextFromRaw(message) {
+        if (!message || typeof message !== 'object') return '';
+        if (typeof message.text === 'string') return message.text;
+        if (typeof message.message === 'string') return message.message;
+        if (typeof message.content === 'string') return message.content;
+        const blocks = Array.isArray(message.content) ? message.content : Array.isArray(message.content?.blocks) ? message.content.blocks : [];
+        return blocks.map(block => {
+            if (typeof block === 'string') return block;
+            if (!block || typeof block !== 'object') return '';
+            return block.text || block.content || block.caption || block.title || '';
+        }).filter(Boolean).join('\n');
+    }
+
+    function contentBlocksFromRaw(message) {
+        if (!message || typeof message !== 'object') return [];
+        const content = Array.isArray(message.content) ? message.content : Array.isArray(message.content?.blocks) ? message.content.blocks : null;
+        if (content) return content.map(block => typeof block === 'object' ? cloneJSON(block) : { type: 'text', text: String(block) });
+        const text = messageTextFromRaw(message);
+        return text ? [{ type: 'text', text }] : [];
+    }
+
+    const ConversationSerializer = {
+        _messageArray(raw) {
+            const candidates = [
+                raw?.chat_messages, raw?.messages, raw?.turns, raw?.nodes,
+                raw?.conversation?.chat_messages, raw?.conversation?.messages,
+                raw?.data?.chat_messages, raw?.data?.messages
+            ];
+            return candidates.find(Array.isArray) || [];
+        },
+
+        _role(message) {
+            const role = String(message?.sender || message?.role || message?.author || '').toLowerCase();
+            return role === 'human' || role === 'user' || role === 'human_user' ? 'human' : role === 'system' ? 'system' : 'assistant';
+        },
+
+        _normalizeMessage(message, index, source) {
+            const id = String(message?.uuid || message?.id || message?.message_uuid || message?.messageId || `${source}-turn-${index}`);
+            const parentId = message?.parent_message_uuid || message?.parentMessageUuid || message?.parent_id || message?.parentId || null;
+            const contentBlocks = contentBlocksFromRaw(message);
+            return {
+                id,
+                parentId: parentId ? String(parentId) : null,
+                index,
+                role: this._role(message),
+                text: messageTextFromRaw(message),
+                contentBlocks,
+                createdAt: message?.created_at || message?.createdAt || null,
+                updatedAt: message?.updated_at || message?.updatedAt || null,
+                model: message?.model || message?.model_name || message?.modelName || null,
+                attachments: cloneJSON(message?.attachments || message?.files || []) || [],
+                artifacts: cloneJSON(message?.artifacts || []) || [],
+                truncated: message?.truncated === true || message?.is_truncated === true || message?.stop_reason === 'max_tokens',
+                stopReason: message?.stop_reason || message?.stopReason || null,
+                renderedHtml: source === 'dom' ? message.html || '' : '',
+                raw: cloneJSON(message) || {}
+            };
+        },
+
+        from(raw, fallbackMessages = []) {
+            const apiMessages = this._messageArray(raw);
+            const source = apiMessages.length ? 'api' : 'dom';
+            const messages = (apiMessages.length ? apiMessages : fallbackMessages).map((message, index) => this._normalizeMessage(message, index, source));
+            const id = String(raw?.uuid || raw?.id || raw?.conversation_uuid || raw?.conversationId || getCurrentConversationId() || 'current');
+            const metadata = {
+                id,
+                title: String(raw?.name || raw?.title || raw?.summary || document.title || 'Claude Conversation').trim().slice(0, 500),
+                createdAt: raw?.created_at || raw?.createdAt || null,
+                updatedAt: raw?.updated_at || raw?.updatedAt || null,
+                model: raw?.model || raw?.model_name || raw?.modelName || null,
+                project: raw?.project?.name || raw?.project_name || raw?.project || null,
+                source
+            };
+            const byId = new Map(messages.map(message => [message.id, message]));
+            const children = {};
+            const roots = [];
+            messages.forEach(message => {
+                if (message.parentId && byId.has(message.parentId)) (children[message.parentId] ||= []).push(message.id);
+                else roots.push(message.id);
+            });
+            const currentId = String(raw?.current_message_uuid || raw?.currentMessageUuid || raw?.current_message_id || messages[messages.length - 1]?.id || '');
+            const activePath = [];
+            const seen = new Set();
+            let cursor = currentId;
+            while (cursor && byId.has(cursor) && !seen.has(cursor)) {
+                seen.add(cursor);
+                activePath.unshift(cursor);
+                cursor = byId.get(cursor).parentId;
+            }
+            if (!activePath.length) messages.forEach(message => activePath.push(message.id));
+            return {
+                schema: 2,
+                exported: new Date().toISOString(),
+                metadata,
+                messages,
+                branches: { roots, children, activePath },
+                failures: source === 'dom' && getCurrentConversationId() ? [{ stage: 'conversation-detail', reason: 'API detail unavailable; rendered DOM fallback used' }] : [],
+                limitations: source === 'dom' ? ['Only messages currently rendered in the page were available'] : []
+            };
+        },
+
+        _activeMessages(archive) {
+            const ids = new Set(archive.branches.activePath || []);
+            return archive.messages.filter(message => ids.has(message.id)).sort((a, b) => (archive.branches.activePath.indexOf(a.id) - archive.branches.activePath.indexOf(b.id)));
+        },
+
+        toMarkdown(archive) {
+            const lines = [
+                '# Claude Conversation Export',
+                '',
+                `- Title: ${archive.metadata.title}`,
+                `- Conversation ID: ${archive.metadata.id}`,
+                `- Source: ${archive.metadata.source}`,
+                `- Exported: ${archive.exported}`,
+                archive.metadata.model ? `- Model: ${archive.metadata.model}` : '',
+                archive.metadata.createdAt ? `- Created: ${archive.metadata.createdAt}` : '',
+                archive.metadata.updatedAt ? `- Updated: ${archive.metadata.updatedAt}` : '',
+                archive.failures.length ? `- Limitations: ${archive.failures.map(f => f.reason).join('; ')}` : '',
+                '',
+                '---', '',
+                archive.metadata.source === 'api' ? '_Markdown follows the active branch; JSON preserves the full tree._' : '_Rendered DOM fallback; unloaded branches are unavailable._',
+                ''
+            ].filter(Boolean);
+            this._activeMessages(archive).forEach(message => {
+                lines.push(`## ${message.role === 'human' ? 'Human' : message.role === 'system' ? 'System' : 'Assistant'}`);
+                if (message.createdAt) lines.push(`_${message.createdAt}_`, '');
+                lines.push(message.text || '_[No text content]_', '');
+                if (message.attachments.length) lines.push(`Attachments: ${message.attachments.length}`, '');
+                if (message.artifacts.length) lines.push(`Artifacts: ${message.artifacts.length}`, '');
+                lines.push('---', '');
+            });
+            return lines.join('\n');
+        },
+
+        toHTML(archive) {
+            const messageHTML = this._activeMessages(archive).map(message => {
+                const blockDetails = message.contentBlocks.length > 1
+                    ? `<details><summary>Content blocks (${message.contentBlocks.length})</summary><pre>${esc(JSON.stringify(message.contentBlocks, null, 2))}</pre></details>` : '';
+                return `<article class="msg ${esc(message.role)}"><div class="role">${esc(message.role)}</div><div class="body">${esc(message.text || '[No text content]').replace(/\n/g, '<br>')}</div>${blockDetails}</article>`;
+            }).join('');
+            const failure = archive.failures.length ? `<p class="notice">${esc(archive.failures.map(f => f.reason).join('; '))}</p>` : '';
+            return '<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' +
+                esc(archive.metadata.title) + '</title><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:900px;margin:40px auto;padding:0 20px;background:#1a1a2e;color:#e0e0e0}.msg{margin:20px 0;padding:16px;border-radius:8px;border-left:4px solid}.human{border-color:#58a6ff;background:rgba(88,166,255,.05)}.assistant{border-color:#bc8cff;background:rgba(188,140,255,.05)}.system{border-color:#d29922;background:rgba(210,153,34,.05)}.role{font-size:12px;font-weight:700;margin-bottom:8px;text-transform:uppercase}.notice{color:#d29922}pre{white-space:pre-wrap;background:rgba(0,0,0,.3);padding:12px;border-radius:6px;overflow:auto}</style></head><body><h1>' +
+                esc(archive.metadata.title) + '</h1><p>Conversation ' + esc(archive.metadata.id) + ' · Exported ' + esc(archive.exported) + '</p>' + failure + messageHTML + '</body></html>';
+        }
+    };
+
     // =====================================================================
     //  CLAUDE API HELPERS
     // =====================================================================
     const ClaudeAPI = {
         _orgId: null,
+        _health: {},
+
+        _category(status) {
+            if (status === 401 || status === 403) return 'auth';
+            if (status === 404) return 'unsupported';
+            if (status === 429) return 'rate-limited';
+            if (status >= 500) return 'server';
+            return status >= 400 ? 'http-error' : 'unknown';
+        },
+
+        _record(label, data = {}) {
+            const current = this._health[label] || {};
+            this._health[label] = {
+                ...current,
+                ...data,
+                label,
+                lastAttempt: data.lastAttempt || new Date().toISOString()
+            };
+            EventBus.emit('api:health', this._health[label]);
+        },
+
+        async _requestJSON(label, url, options = {}) {
+            const started = Date.now();
+            try {
+                const response = await fetch(url, options);
+                const retryAfter = response.headers?.get?.('Retry-After') || null;
+                if (!response.ok) {
+                    this._record(label, { status: response.status, category: this._category(response.status), retryAfter, ok: false, duration: Date.now() - started, detail: 'HTTP ' + response.status });
+                    return { ok: false, data: null };
+                }
+                let data;
+                try { data = await response.json(); } catch (e) {
+                    this._record(label, { status: response.status, category: 'schema', retryAfter, ok: false, duration: Date.now() - started, detail: 'Invalid JSON response' });
+                    return { ok: false, data: null };
+                }
+                this._record(label, { status: response.status, category: 'ok', retryAfter, ok: true, duration: Date.now() - started, detail: 'OK', lastSuccess: new Date().toISOString() });
+                return { ok: true, data };
+            } catch (e) {
+                this._record(label, { status: 0, category: 'network', ok: false, duration: Date.now() - started, detail: e.message || 'Network request failed' });
+                return { ok: false, data: null };
+            }
+        },
 
         async getOrgs() {
-            const r = await fetch('/api/organizations', { credentials: 'include' });
-            const data = await r.json();
-            if (Array.isArray(data)) return data;
-            return data.organizations || data.data || [];
+            const result = await this._requestJSON('organizations', '/api/organizations', { credentials: 'include' });
+            if (!result.ok) return [];
+            const data = result.data;
+            const orgs = Array.isArray(data) ? data : data?.organizations || data?.data || [];
+            if (!Array.isArray(orgs)) {
+                this._record('organizations', { category: 'schema', ok: false, detail: 'Organizations array missing' });
+                return [];
+            }
+            return orgs;
         },
         async getOrgId() {
             if (this._orgId) return this._orgId;
@@ -307,69 +676,218 @@
             return this._orgId;
         },
         async getUsage() {
-            try {
-                const orgId = await this.getOrgId();
-                if (!orgId) return null;
-                const r = await fetch(`/api/organizations/${orgId}/usage`, { credentials: 'include' });
-                return r.json();
-            } catch (e) { return null; }
+            const orgId = await this.getOrgId();
+            if (!orgId) {
+                this._record('usage', { status: 0, category: 'auth', ok: false, detail: 'Organization unavailable' });
+                return null;
+            }
+            const result = await this._requestJSON('usage', `/api/organizations/${orgId}/usage`, { credentials: 'include' });
+            if (!result.ok || !result.data || typeof result.data !== 'object') {
+                if (result.ok) this._record('usage', { category: 'schema', ok: false, detail: 'Usage object missing' });
+                return null;
+            }
+            return result.data;
         },
         async getSettings() {
-            try {
-                const r = await fetch('/api/account', { credentials: 'include' });
-                const data = await r.json();
-                return data.settings;
-            } catch (e) { return null; }
+            const result = await this._requestJSON('account', '/api/account', { credentials: 'include' });
+            if (!result.ok) return null;
+            if (!result.data || typeof result.data.settings !== 'object') {
+                this._record('account', { category: 'schema', ok: false, detail: 'Settings object missing' });
+                return null;
+            }
+            return result.data.settings;
         },
         async toggleFeature(key, value, exclusiveKey = null) {
-            try {
-                const body = { [key]: value };
-                if (exclusiveKey && value) body[exclusiveKey] = false;
-                const r = await fetch('/api/account/settings', {
-                    method: 'PATCH',
-                    headers: { 'Content-Type': 'application/json' },
-                    credentials: 'include',
-                    body: JSON.stringify(body)
-                });
-                return r.ok ? await r.json() : null;
-            } catch (e) { return null; }
+            const body = { [key]: value };
+            if (exclusiveKey && value) body[exclusiveKey] = false;
+            const result = await this._requestJSON('accountSettings', '/api/account/settings', {
+                method: 'PATCH', headers: { 'Content-Type': 'application/json' }, credentials: 'include', body: JSON.stringify(body)
+            });
+            return result.ok ? result.data : null;
         },
         _extractConversationArray(data) {
             if (Array.isArray(data)) return data;
-            return data?.chat_conversations || data?.conversations || data?.items || data?.data || [];
+            const candidates = [data?.chat_conversations, data?.conversations, data?.items, data?.data];
+            return candidates.find(Array.isArray) || [];
         },
         async listConversations(limit = 200) {
-            try {
-                const orgId = await this.getOrgId();
-                if (!orgId) return [];
-                const out = [];
-                let cursor = null;
-                let offset = 0;
-                for (let page = 0; page < 8 && out.length < limit; page++) {
-                    const pageLimit = Math.min(100, limit - out.length);
-                    const query = cursor
-                        ? `limit=${pageLimit}&cursor=${encodeURIComponent(cursor)}`
-                        : `limit=${pageLimit}&offset=${offset}`;
-                    const r = await fetch(`/api/organizations/${orgId}/chat_conversations?${query}`, { credentials: 'include' });
-                    if (!r.ok) break;
-                    const data = await r.json();
-                    const items = this._extractConversationArray(data);
-                    if (!items.length) break;
-                    out.push(...items);
-                    cursor = data.next_cursor || data.nextCursor || data.cursor || null;
-                    offset += items.length;
-                    if (!cursor && data.has_more !== true && data.hasMore !== true) break;
+            const orgId = await this.getOrgId();
+            if (!orgId) return [];
+            const out = [];
+            let cursor = null;
+            let offset = 0;
+            const safeLimit = Math.max(1, Math.min(2000, Number(limit) || 200));
+            for (let page = 0; page < 20 && out.length < safeLimit; page++) {
+                const pageLimit = Math.min(100, safeLimit - out.length);
+                const query = cursor ? `limit=${pageLimit}&cursor=${encodeURIComponent(cursor)}` : `limit=${pageLimit}&offset=${offset}`;
+                const result = await this._requestJSON('conversationList', `/api/organizations/${orgId}/chat_conversations?${query}`, { credentials: 'include' });
+                if (!result.ok) break;
+                const data = result.data;
+                const items = this._extractConversationArray(data);
+                if (!items.length) {
+                    if (data && !Array.isArray(data)) this._record('conversationList', { category: 'schema', ok: false, detail: 'Conversation array missing' });
+                    break;
                 }
-                return out;
-            } catch (e) { return []; }
+                out.push(...items);
+                cursor = data.next_cursor || data.nextCursor || data.cursor || null;
+                offset += items.length;
+                if (!cursor && data.has_more !== true && data.hasMore !== true) break;
+            }
+            return out;
         },
         async getConversation(id) {
+            const orgId = await this.getOrgId();
+            if (!orgId || !id) return null;
+            const result = await this._requestJSON('conversationDetail', `/api/organizations/${orgId}/chat_conversations/${encodeURIComponent(id)}`, { credentials: 'include' });
+            return result.ok && result.data && typeof result.data === 'object' ? result.data : null;
+        },
+        getHealth() {
+            return Object.fromEntries(Object.entries(this._health).map(([key, value]) => [key, { ...value }]));
+        },
+        getLastStatus(label) {
+            return this._health[label] ? { ...this._health[label] } : null;
+        }
+    };
+
+    // =====================================================================
+    //  VERSIONED LOCAL STORAGE
+    // =====================================================================
+    // GM_* values are shared with older CUE releases and may be strings,
+    // objects, malformed JSON, or values written by a different manager.
+    // Every structured store goes through this repository so reads are
+    // bounded, migrations are explicit, and a bad value never overwrites a
+    // good one silently.
+    const StorageRepository = {
+        MAX_BYTES: 1024 * 1024,
+        MAX_QUARANTINE_BYTES: 256 * 1024,
+        _stores: new Map(),
+
+        _size(value) {
+            const text = typeof value === 'string' ? value : JSON.stringify(value);
+            try { return new TextEncoder().encode(text).length; } catch (e) { return text.length; }
+        },
+
+        _emit(level, message, key) {
+            EventBus.emit('storage:error', { level, source: key || 'storage', message: String(message) });
+        },
+
+        _getRaw(key) {
+            try { return GM_getValue(key, null); } catch (e) {
+                this._emit('error', 'read failed: ' + e.message, key);
+                return null;
+            }
+        },
+
+        _parse(raw) {
+            if (raw === null || raw === undefined || raw === '') return null;
+            if (typeof raw === 'string') return JSON.parse(raw);
+            return raw;
+        },
+
+        _quarantine(key, raw, reason) {
+            const serialized = typeof raw === 'string' ? raw : (() => {
+                try { return JSON.stringify(raw); } catch (e) { return String(raw); }
+            })();
+            const record = JSON.stringify({
+                schema: 1,
+                key,
+                quarantinedAt: new Date().toISOString(),
+                reason: String(reason),
+                raw: serialized.slice(0, this.MAX_QUARANTINE_BYTES)
+            });
             try {
-                const orgId = await this.getOrgId();
-                if (!orgId || !id) return null;
-                const r = await fetch(`/api/organizations/${orgId}/chat_conversations/${id}`, { credentials: 'include' });
-                return r.ok ? await r.json() : null;
-            } catch (e) { return null; }
+                GM_setValue(key + '_quarantine', record);
+                this._emit('warn', 'invalid data quarantined (' + reason + ')', key);
+            } catch (e) {
+                this._emit('error', 'quarantine failed: ' + e.message, key);
+            }
+        },
+
+        read(key, fallback, options = {}) {
+            const version = Number.isInteger(options.version) ? options.version : 1;
+            const maxBytes = options.maxBytes || this.MAX_BYTES;
+            const raw = this._getRaw(key);
+            if (raw === null || raw === undefined || raw === '') {
+                this._stores.set(key, { version, bytes: 0, updated: null, valid: true });
+                return fallback;
+            }
+            if (this._size(raw) > maxBytes) {
+                this._quarantine(key, raw, 'value exceeds ' + maxBytes + ' bytes');
+                this._stores.set(key, { version, bytes: this._size(raw), updated: null, valid: false });
+                return fallback;
+            }
+
+            let parsed;
+            try { parsed = this._parse(raw); } catch (e) {
+                this._quarantine(key, raw, 'malformed JSON');
+                this._stores.set(key, { version, bytes: this._size(raw), updated: null, valid: false });
+                return fallback;
+            }
+
+            const envelope = parsed && typeof parsed === 'object' && Object.prototype.hasOwnProperty.call(parsed, 'schema') && Object.prototype.hasOwnProperty.call(parsed, 'data');
+            let data = envelope ? parsed.data : parsed;
+            const storedVersion = envelope ? Number(parsed.schema) : 0;
+            let migrated = false;
+            try {
+                if (storedVersion > version) throw new Error('unsupported schema ' + storedVersion);
+                if (options.migrate && storedVersion !== version) {
+                    data = options.migrate(data, storedVersion);
+                    migrated = true;
+                }
+                if (options.validate && !options.validate(data)) throw new Error('schema validation failed');
+            } catch (e) {
+                this._quarantine(key, raw, e.message);
+                this._stores.set(key, { version, bytes: this._size(raw), updated: parsed?.updated || null, valid: false });
+                return fallback;
+            }
+
+            const shouldRewrite = !envelope || storedVersion !== version || migrated;
+            if (shouldRewrite) this.write(key, data, { version, maxBytes });
+            this._stores.set(key, { version, bytes: this._size(raw), updated: parsed?.updated || null, valid: true });
+            return data;
+        },
+
+        write(key, data, options = {}) {
+            const version = Number.isInteger(options.version) ? options.version : 1;
+            const maxBytes = options.maxBytes || this.MAX_BYTES;
+            const envelope = { schema: version, updated: new Date().toISOString(), data };
+            let serialized;
+            try { serialized = JSON.stringify(envelope); } catch (e) {
+                this._emit('error', 'serialization failed: ' + e.message, key);
+                return false;
+            }
+            const bytes = this._size(serialized);
+            if (bytes > maxBytes) {
+                this._emit('error', 'write rejected above ' + maxBytes + ' bytes', key);
+                return false;
+            }
+            try {
+                GM_setValue(key, serialized);
+                this._stores.set(key, { version, bytes, updated: envelope.updated, valid: true });
+                return true;
+            } catch (e) {
+                this._emit('error', 'write failed: ' + e.message, key);
+                return false;
+            }
+        },
+
+        remove(key) {
+            try {
+                GM_setValue(key, '');
+                this._stores.delete(key);
+                return true;
+            } catch (e) {
+                this._emit('error', 'clear failed: ' + e.message, key);
+                return false;
+            }
+        },
+
+        inspect(keys) {
+            return keys.map(key => {
+                const known = this._stores.get(key);
+                const raw = this._getRaw(key);
+                return { key, bytes: known?.bytes || (raw ? this._size(raw) : 0), updated: known?.updated || null, valid: known?.valid !== false };
+            });
         }
     };
 
@@ -380,6 +898,7 @@
         _installed: false,
         lastUsage: null,
         lastMessageLimit: null,
+        _lastStream: null,
 
         install() {
             if (this._installed) return;
@@ -400,7 +919,7 @@
                 try {
                     const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
                     if (url.includes('/completion') || url.includes('/chat_conversations')) {
-                        const ct = response.headers.get('content-type') || '';
+                        const ct = response.headers?.get?.('content-type') || '';
                         if (ct.includes('text/event-stream')) {
                             self._processStream(response.clone()).catch(() => {});
                         }
@@ -411,9 +930,17 @@
         },
 
         async _processStream(response) {
+            if (!response?.body?.getReader) {
+                this._lastStream = { status: 'unsupported', detail: 'SSE response body unavailable', time: new Date().toISOString() };
+                EventBus.emit('stream:health', this._lastStream);
+                return;
+            }
             const reader = response.body.getReader();
             const decoder = new TextDecoder();
             let buffer = '';
+            let malformed = 0;
+            let events = 0;
+            let streamStatus = 'complete';
             try {
                 while (true) {
                     const { done, value } = await reader.read();
@@ -425,14 +952,17 @@
                         if (!line.startsWith('data: ')) continue;
                         const j = line.substring(6).trim();
                         if (!j || j === '[DONE]') continue;
-                        try { this._processSSE(JSON.parse(j)); } catch (e) { /* skip */ }
+                        try { this._processSSE(JSON.parse(j)); events++; } catch (e) { malformed++; }
                     }
                 }
-            } catch (e) { /* stream aborted */ }
+            } catch (e) { streamStatus = 'aborted'; }
+            this._lastStream = { status: streamStatus, events, malformed, time: new Date().toISOString(), detail: malformed ? 'Malformed SSE events skipped' : 'OK' };
+            EventBus.emit('stream:health', this._lastStream);
             EventBus.emit('stream:end');
         },
 
         _processSSE(data) {
+            if (!data || typeof data !== 'object') throw new Error('SSE payload is not an object');
             // Message limit data
             if (data.message_limit !== undefined) {
                 this.lastMessageLimit = data.message_limit;
@@ -972,14 +1502,16 @@
         },
 
         _load() {
-            try {
-                const saved = GM_getValue(this.STORAGE_KEY, '[]');
-                this._events = JSON.parse(saved).filter(t => Number.isFinite(t));
-            } catch (e) { this._events = []; }
+            this._events = StorageRepository.read(this.STORAGE_KEY, [], {
+                version: 1,
+                maxBytes: 256 * 1024,
+                migrate: value => Array.isArray(value) ? value : JSON.parse(value || '[]'),
+                validate: value => Array.isArray(value) && value.every(t => Number.isFinite(t))
+            }).filter(t => Number.isFinite(t)).slice(-10000);
             this._prune();
         },
 
-        _save() { GM_setValue(this.STORAGE_KEY, JSON.stringify(this._events)); },
+        _save() { StorageRepository.write(this.STORAGE_KEY, this._events, { version: 1, maxBytes: 256 * 1024 }); },
 
         _prune() {
             const cutoff = Date.now() - (8 * 24 * 60 * 60 * 1000);
@@ -1371,7 +1903,10 @@
                 placeholder.className = PREFIX + '-trim-placeholder';
                 placeholder.dataset.trimId = id;
                 placeholder.style.cssText = 'height:4px;margin:2px 0;background:rgba(128,128,128,0.1);border-radius:2px;';
-                this._cache.set(id, { html: el.outerHTML, parent: el.parentElement, next: el.nextSibling });
+                // Keep the original node detached instead of serializing and
+                // reparsing host HTML. This preserves event handlers and
+                // avoids turning conversation markup into an executable sink.
+                this._cache.set(id, { node: el, parent: el.parentElement, next: el.nextSibling });
                 el.replaceWith(placeholder);
             });
             EventBus.emit('trimmer:pruned', { removed: toRemove.length, total: msgs.length });
@@ -1381,9 +1916,9 @@
             this._cache.forEach((data, id) => {
                 const ph = $(`[data-trim-id="${id}"]`);
                 if (ph) {
-                    const tmp = document.createElement('div');
-                    setHTML(tmp, data.html);
-                    ph.replaceWith(tmp.firstElementChild);
+                    ph.replaceWith(data.node);
+                } else if (data.parent && data.parent.isConnected) {
+                    data.parent.insertBefore(data.node, data.next && data.next.parentNode === data.parent ? data.next : null);
                 }
             });
             this._cache.clear();
@@ -1608,6 +2143,7 @@
         init() {
             // Capture module errors
             EventBus.on('module:error', (data) => this._add('error', data.module, data.error));
+            EventBus.on('storage:error', (data) => this._add(data.level || 'warn', data.source || 'storage', data.message));
         },
 
         _add(level, source, message) {
@@ -1742,31 +2278,33 @@
         },
 
         _load() {
-            try {
-                const saved = JSON.parse(GM_getValue(this.STORAGE_KEY, '{}'));
-                this.items = Array.isArray(saved.items) ? saved.items : [];
-                this.lastIndexed = saved.lastIndexed || null;
-            } catch (e) {
-                this.items = [];
-                this.lastIndexed = null;
-            }
+            const saved = StorageRepository.read(this.STORAGE_KEY, { items: [], lastIndexed: null }, {
+                version: 1,
+                maxBytes: 1024 * 1024,
+                migrate: value => Array.isArray(value) ? { items: value, lastIndexed: null } : value,
+                validate: value => value && typeof value === 'object' && Array.isArray(value.items) && value.items.every(item =>
+                    item && typeof item.id === 'string' && item.id.length <= 200 && typeof item.title === 'string' &&
+                    typeof item.text === 'string' && item.text.length <= 200000)
+            });
+            this.items = saved.items.slice(0, 500);
+            this.lastIndexed = typeof saved.lastIndexed === 'string' ? saved.lastIndexed : null;
         },
 
         _save() {
-            GM_setValue(this.STORAGE_KEY, JSON.stringify({
+            StorageRepository.write(this.STORAGE_KEY, {
                 lastIndexed: this.lastIndexed,
                 items: this.items.slice(0, 500)
-            }));
+            }, { version: 1, maxBytes: 1024 * 1024 });
         },
 
         _normalize(raw) {
-            const id = raw.uuid || raw.id || raw.conversation_uuid || raw.conversationId;
+            const id = String(raw.uuid || raw.id || raw.conversation_uuid || raw.conversationId || '');
             if (!id) return null;
-            const title = raw.name || raw.title || raw.summary || 'Untitled conversation';
-            const updated = raw.updated_at || raw.updatedAt || raw.created_at || raw.createdAt || '';
+            const title = String(raw.name || raw.title || raw.summary || 'Untitled conversation').slice(0, 500);
+            const updated = String(raw.updated_at || raw.updatedAt || raw.created_at || raw.createdAt || '');
             const messages = raw.chat_messages || raw.messages || [];
             const messageText = Array.isArray(messages)
-                ? messages.map(m => m.text || m.content || m.message || '').join(' ')
+                ? messages.map(m => String(m?.text || m?.content || m?.message || '')).join(' ')
                 : '';
             const text = [
                 title,
@@ -1774,7 +2312,7 @@
                 raw.preview || '',
                 raw.last_message || '',
                 messageText
-            ].join(' ').replace(/\s+/g, ' ').trim();
+            ].map(value => String(value)).join(' ').replace(/\s+/g, ' ').trim().slice(0, 200000);
             return { id, title, updated, text };
         },
 
@@ -1829,6 +2367,47 @@
             location.href = `${location.origin}/chat/${id}`;
         },
 
+        destroy() {}
+    };
+
+    // =====================================================================
+    //  MODULE: HEALTH DIAGNOSTICS
+    // =====================================================================
+    const DiagnosticsModule = {
+        id: 'diagnostics',
+        checks: [],
+        lastRun: null,
+
+        init() {
+            EventBus.on('api:health', () => this.collect(false));
+            EventBus.on('stream:health', () => this.collect(false));
+        },
+
+        async collect(force = false) {
+            if (force && !ClaudeAPI.getLastStatus('organizations')) await ClaudeAPI.getOrgId();
+            const health = ClaudeAPI.getHealth();
+            const apiCheck = (id, label, key) => {
+                const status = health[key];
+                return { id, label, state: status ? (status.ok ? 'pass' : 'fail') : 'unknown', detail: status ? `${status.category}: ${status.detail}` : 'Not checked' };
+            };
+            const sse = StreamMonitor._lastStream;
+            this.checks = [
+                { id: 'editor', label: 'Editor', state: DOM.getEditor() ? 'pass' : 'fail', detail: DOM.getEditor() ? 'Found' : 'Selector not found' },
+                { id: 'send', label: 'Send button', state: DOM.getSendButton() ? 'pass' : 'fail', detail: DOM.getSendButton() ? 'Found' : 'Selector not found' },
+                { id: 'stop', label: 'Stop button', state: DOM.getStopButton() ? 'pass' : 'unknown', detail: DOM.getStopButton() ? 'Found' : 'Not visible while idle' },
+                { id: 'messages', label: 'Message groups', state: document.querySelectorAll(SEL.msgGroup).length ? 'pass' : 'unknown', detail: `${document.querySelectorAll(SEL.msgGroup).length} found` },
+                { id: 'org', label: 'Organization', state: ClaudeAPI._orgId ? 'pass' : health.organizations?.category === 'auth' ? 'fail' : 'unknown', detail: ClaudeAPI._orgId ? 'Resolved' : health.organizations?.detail || 'Not checked' },
+                apiCheck('usage', 'Usage API', 'usage'),
+                apiCheck('conversation', 'Conversation API', 'conversationDetail'),
+                { id: 'fetch', label: 'Fetch monitor', state: StreamMonitor._installed ? 'pass' : 'fail', detail: StreamMonitor._installed ? 'Installed' : 'Not installed' },
+                { id: 'sse', label: 'Last SSE stream', state: !sse ? 'unknown' : sse.status === 'complete' && !sse.malformed ? 'pass' : 'fail', detail: sse ? `${sse.status}, ${sse.events || 0} events, ${sse.malformed || 0} malformed` : 'No stream observed' }
+            ];
+            this.lastRun = new Date().toISOString();
+            EventBus.emit('diagnostics:updated', this.getSummary());
+            return this.getSummary();
+        },
+
+        getSummary() { return { checks: this.checks.map(check => ({ ...check })), lastRun: this.lastRun }; },
         destroy() {}
     };
 
@@ -1925,21 +2504,25 @@
                 transcript = '[Older transcript omitted because it exceeded the safe paste size.]\n\n' + transcript.slice(-maxChars);
             }
             const prompt = `Continue from this forked Claude conversation. Preserve the decisions, constraints, and current task state from the transcript below, then proceed from the final turn.\n\n---\n\n${transcript}`;
-            GM_setValue(this.PENDING_KEY, JSON.stringify({ prompt, created: Date.now() }));
+            StorageRepository.write(this.PENDING_KEY, { prompt, created: Date.now() }, { version: 1, maxBytes: 256 * 1024 });
             showToast(`Fork queued through turn ${messages.length}`, 1800, 'success');
             location.href = `${location.origin}/new`;
         },
 
         async trySendPending() {
             if (this._sending || getCurrentConversationId()) return;
-            let payload = null;
-            try { payload = JSON.parse(GM_getValue(this.PENDING_KEY, 'null')); } catch (e) { payload = null; }
+            const payload = StorageRepository.read(this.PENDING_KEY, null, {
+                version: 1,
+                maxBytes: 256 * 1024,
+                migrate: value => typeof value === 'string' ? JSON.parse(value) : value,
+                validate: value => !value || (value && typeof value.prompt === 'string' && value.prompt.length <= 120000 && Number.isFinite(value.created))
+            });
             if (!payload?.prompt) return;
             this._sending = true;
             try {
                 await waitForElement(SEL.editor, 20000);
                 await DOM.sendMessage(payload.prompt);
-                GM_setValue(this.PENDING_KEY, '');
+                StorageRepository.remove(this.PENDING_KEY);
                 showToast('Fork sent to new conversation', 2200, 'success');
             } catch (e) {
                 showToast('Fork send failed: ' + e.message, 3000, 'error');
@@ -2012,14 +2595,18 @@
         },
 
         _load() {
-            try {
-                const saved = GM_getValue(this.STORAGE_KEY, null);
-                this.snippets = saved ? JSON.parse(saved) : { ...this.DEFAULT_SNIPPETS };
-            } catch (e) { this.snippets = { ...this.DEFAULT_SNIPPETS }; }
+            const saved = StorageRepository.read(this.STORAGE_KEY, { ...this.DEFAULT_SNIPPETS }, {
+                version: 1,
+                maxBytes: 256 * 1024,
+                migrate: value => value && typeof value === 'object' && !Array.isArray(value) ? value : JSON.parse(value || '{}'),
+                validate: value => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(key =>
+                    /^;[\w-]{1,40}$/.test(key) && typeof value[key] === 'string' && value[key].length <= 20000)
+            });
+            this.snippets = { ...this.DEFAULT_SNIPPETS, ...saved };
         },
 
         save() {
-            GM_setValue(this.STORAGE_KEY, JSON.stringify(this.snippets));
+            StorageRepository.write(this.STORAGE_KEY, this.snippets, { version: 1, maxBytes: 256 * 1024 });
         },
 
         add(trigger, expansion) {
@@ -2079,46 +2666,54 @@
 
         init() { this._load(); },
 
+        _normalize(raw) {
+            if (!raw || typeof raw !== 'object') return null;
+            const id = String(raw.id || '');
+            const label = String(raw.label || '').trim();
+            const prompt = String(raw.prompt || '');
+            const cat = this.CATEGORIES.some(c => c.id === raw.cat) ? raw.cat : 'custom';
+            if (!/^[\w-]{1,80}$/.test(id) || !label || label.length > 120 || prompt.length > 50000 || /[<>]/.test(label)) return null;
+            const history = Array.isArray(raw.history) ? raw.history.slice(-10).filter(h => h && typeof h.prompt === 'string' && typeof h.label === 'string').map(h => ({
+                prompt: h.prompt.slice(0, 50000), label: h.label.slice(0, 120), time: Number.isFinite(h.time) ? h.time : Date.now()
+            })) : [];
+            return { id, label, prompt, cat, history };
+        },
+
         _load() {
-            try {
-                const saved = GM_getValue(this.STORAGE_KEY, null);
-                if (saved) {
-                    const parsed = JSON.parse(saved);
-                    this.prompts = this.DEFAULT_PROMPTS.map(def => {
-                        const s = parsed.find(p => p.id === def.id);
-                        return s ? {
-                            ...def,
-                            label: s.label,
-                            prompt: s.prompt,
-                            cat: s.cat || def.cat,
-                            history: Array.isArray(s.history) ? s.history : []
-                        } : { ...def, history: [] };
-                    });
-                    // Keep any extra custom prompts
-                    parsed.forEach(p => { if (!this.prompts.find(x => x.id === p.id)) this.prompts.push(p); });
-                    return;
-                }
-            } catch (e) { /* ignore */ }
-            this.prompts = this.DEFAULT_PROMPTS.map(d => ({ ...d }));
+            const parsed = StorageRepository.read(this.STORAGE_KEY, [], {
+                version: 1,
+                maxBytes: 1024 * 1024,
+                migrate: value => Array.isArray(value) ? value : JSON.parse(value || '[]'),
+                validate: value => Array.isArray(value) && value.length <= 500
+            });
+            const valid = parsed.map(p => this._normalize(p)).filter(Boolean);
+            this.prompts = this.DEFAULT_PROMPTS.map(def => {
+                const saved = valid.find(p => p.id === def.id);
+                return saved ? { ...def, ...saved } : { ...def, history: [] };
+            });
+            valid.forEach(p => { if (!this.prompts.find(x => x.id === p.id)) this.prompts.push(p); });
         },
 
         save() {
-            GM_setValue(this.STORAGE_KEY, JSON.stringify(this.prompts.map(p => ({
+            const records = this.prompts.map(p => ({
                 id: p.id, label: p.label, prompt: p.prompt, cat: p.cat,
                 history: p.history || []
-            }))));
+            }));
+            StorageRepository.write(this.STORAGE_KEY, records, { version: 1, maxBytes: 1024 * 1024 });
         },
 
         add(label, prompt, cat = 'custom') {
             const id = 'user_' + Date.now();
-            this.prompts.push({ id, label, prompt, cat, history: [] });
+            const record = this._normalize({ id, label, prompt, cat, history: [] });
+            if (!record) { StorageRepository._emit('warn', 'rejected invalid prompt', this.STORAGE_KEY); return null; }
+            this.prompts.push(record);
             this.save();
             return id;
         },
 
         update(id, label, prompt) {
             const p = this.prompts.find(x => x.id === id);
-            if (p) {
+            if (p && this._normalize({ id, label, prompt, cat: p.cat, history: p.history })) {
                 // Save version history before overwriting
                 if (p.prompt && p.prompt !== prompt) {
                     if (!p.history) p.history = [];
@@ -2126,7 +2721,7 @@
                     // Keep max 10 versions
                     if (p.history.length > 10) p.history.shift();
                 }
-                p.label = label; p.prompt = prompt; this.save();
+                p.label = label.trim(); p.prompt = prompt; this.save();
             }
         },
 
@@ -2358,20 +2953,14 @@
             });
         },
 
-        _showExportMenu() {
-            const main = document.querySelector('main');
-            if (!main) { showToast('No conversation found', 2000, 'warn'); return; }
-            const groups = main.querySelectorAll(SEL.msgGroup);
-            if (groups.length === 0) { showToast('No messages found', 2000, 'warn'); return; }
-
-            // Gather messages
-            const messages = [];
-            groups.forEach((g) => {
-                const isUser = !!g.querySelector(SEL.userMsg);
-                const text = getCleanElementText(g);
-                const html = g.innerHTML;
-                if (text) messages.push({ role: isUser ? 'human' : 'assistant', text, html });
-            });
+        async _showExportMenu() {
+            const fallbackMessages = getConversationMessages();
+            const id = getCurrentConversationId();
+            let raw = null;
+            if (id) raw = await ClaudeAPI.getConversation(id);
+            const archive = ConversationSerializer.from(raw, fallbackMessages);
+            if (!archive.messages.length) { showToast('No conversation found', 2000, 'warn'); return; }
+            const branchEdges = Object.values(archive.branches.children).reduce((sum, ids) => sum + ids.length, 0);
 
             const overlay = document.createElement('div');
             overlay.className = PREFIX + '-modal-overlay';
@@ -2379,7 +2968,8 @@
             modal.className = PREFIX + '-modal';
             setHTML(modal, `
                 <h3>Export Conversation</h3>
-                <p style="color:#888;font-size:12px;margin:0 0 12px">${messages.length} messages</p>
+                <p style="color:#888;font-size:12px;margin:0 0 12px">${archive.messages.length} messages · ${branchEdges} branch links · ${esc(archive.metadata.source)} source</p>
+                ${archive.failures.length ? `<p style="color:#d29922;font-size:10px">${esc(archive.failures.map(f => f.reason).join('; '))}</p>` : ''}
                 <div style="display:flex;gap:6px;flex-wrap:wrap">
                     <button class="${PREFIX}-modal-btn primary" data-fmt="md">Markdown</button>
                     <button class="${PREFIX}-modal-btn primary" data-fmt="json" style="background:#bc8cff;border-color:#bc8cff">JSON</button>
@@ -2401,27 +2991,13 @@
                     let content, mime, ext;
 
                     if (fmt === 'md') {
-                        content = '# Claude Conversation Export\n_Exported: ' + new Date().toISOString() + '_\n\n---\n\n';
-                        messages.forEach(m => { content += '## ' + (m.role === 'human' ? 'Human' : 'Assistant') + '\n\n' + m.text + '\n\n---\n\n'; });
+                        content = ConversationSerializer.toMarkdown(archive);
                         mime = 'text/markdown'; ext = 'md';
                     } else if (fmt === 'json') {
-                        content = JSON.stringify({
-                            exported: new Date().toISOString(),
-                            messages: messages.map(m => ({ role: m.role, content: m.text }))
-                        }, null, 2);
+                        content = JSON.stringify(archive, null, 2);
                         mime = 'application/json'; ext = 'json';
                     } else {
-                        content = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Claude Chat Export</title>' +
-                            '<style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:800px;margin:40px auto;padding:0 20px;background:#1a1a2e;color:#e0e0e0}' +
-                            '.msg{margin:20px 0;padding:16px;border-radius:8px;border-left:4px solid}.human{border-color:#58a6ff;background:rgba(88,166,255,0.05)}' +
-                            '.assistant{border-color:#bc8cff;background:rgba(188,140,255,0.05)}.role{font-size:12px;font-weight:700;margin-bottom:8px;text-transform:uppercase}' +
-                            '.human .role{color:#58a6ff}.assistant .role{color:#bc8cff}pre{background:rgba(0,0,0,0.3);padding:12px;border-radius:6px;overflow-x:auto}</style></head>' +
-                            '<body><h1>Claude Conversation Export</h1><p style="color:#888">Exported: ' + new Date().toISOString() + '</p>';
-                        messages.forEach(m => {
-                            content += '<div class="msg ' + m.role + '"><div class="role">' + (m.role === 'human' ? 'Human' : 'Assistant') + '</div>' +
-                                '<div>' + m.text.replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>') + '</div></div>';
-                        });
-                        content += '</body></html>';
+                        content = ConversationSerializer.toHTML(archive);
                         mime = 'text/html'; ext = 'html';
                     }
 
@@ -2430,7 +3006,7 @@
                     const a = document.createElement('a');
                     a.href = url; a.download = 'claude-chat-' + datestamp + '.' + ext;
                     document.body.appendChild(a); a.click(); document.body.removeChild(a);
-                    URL.revokeObjectURL(url);
+                    setTimeout(() => URL.revokeObjectURL(url), 1000);
                     overlay.remove();
                     showToast('Chat exported as ' + ext.toUpperCase() + '!', 2000, 'success');
                 });
@@ -2773,6 +3349,14 @@
                     <div id="${PREFIX}-usage-content"><span style="color:#555;font-size:10px">Loading usage...</span></div>
                 </div>
 
+                <div class="${PREFIX}-section" id="${PREFIX}-diagnostics-section">
+                    <div style="display:flex;justify-content:space-between;align-items:center">
+                        <span class="${PREFIX}-section-title" style="margin:0">Diagnostics</span>
+                        <button class="${PREFIX}-tool-btn" id="${PREFIX}-diagnostics-refresh" aria-label="Refresh CUE diagnostics">Refresh</button>
+                    </div>
+                    <div id="${PREFIX}-diagnostics-content"><span style="color:#555;font-size:10px">Not checked</span></div>
+                </div>
+
                 <div class="${PREFIX}-section">
                     <div class="${PREFIX}-row"><span class="${PREFIX}-row-label">Context</span><span id="${PREFIX}-ctx-pct" style="color:#3fb950;font-weight:600;font-size:11px">0%</span></div>
                     <div class="${PREFIX}-usage-bar"><div id="${PREFIX}-ctx-bar" class="${PREFIX}-ctx-fill good" style="width:0%"></div></div>
@@ -2979,15 +3563,12 @@
 
             // Export config
             $(`#${PREFIX}-export-config`).addEventListener('click', () => {
-                const config = {};
-                Object.keys(Settings._defaults).forEach(k => { config[k] = Settings.get(k); });
-                config._prompts = PromptModule.prompts.map(p => ({ id: p.id, label: p.label, prompt: p.prompt, cat: p.cat }));
-                const blob = new Blob([JSON.stringify(config, null, 2)], { type: 'application/json' });
+                const blob = new Blob([JSON.stringify(ConfigCodec.create(), null, 2)], { type: 'application/json' });
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement('a');
                 a.href = url; a.download = 'cue-config-' + new Date().toISOString().slice(0, 10) + '.json';
                 document.body.appendChild(a); a.click(); document.body.removeChild(a);
-                URL.revokeObjectURL(url);
+                setTimeout(() => URL.revokeObjectURL(url), 1000);
                 showToast('Config exported!', 2000, 'success');
             });
 
@@ -2997,23 +3578,28 @@
                 input.type = 'file'; input.accept = '.json';
                 input.addEventListener('change', () => {
                     const file = input.files[0]; if (!file) return;
+                    if (file.size > ConfigCodec.MAX_BYTES) { showToast('Config exceeds 512 KB', 3000, 'error'); return; }
                     const reader = new FileReader();
                     reader.onload = (e) => {
                         try {
-                            const config = JSON.parse(e.target.result);
+                            const result = ConfigCodec.parse(String(e.target.result || ''));
                             let imported = 0;
                             Object.keys(Settings._defaults).forEach(k => {
-                                if (k in config) { Settings.set(k, config[k]); imported++; }
+                                if (Object.prototype.hasOwnProperty.call(result.settings, k) && Settings.set(k, result.settings[k])) imported++;
                             });
-                            if (config._prompts && Array.isArray(config._prompts)) {
-                                config._prompts.forEach(p => {
+                            if (result.prompts.length) {
+                                result.prompts.forEach(p => {
                                     const existing = PromptModule.prompts.find(x => x.id === p.id);
-                                    if (existing) { existing.label = p.label; existing.prompt = p.prompt; existing.cat = p.cat; }
-                                    else { PromptModule.prompts.push(p); }
+                                    if (existing) {
+                                        existing.label = p.label; existing.prompt = p.prompt; existing.cat = p.cat;
+                                        existing.history = p.history || existing.history || [];
+                                    } else PromptModule.prompts.push(p);
                                 });
                                 PromptModule.save();
                             }
-                            showToast(`Imported ${imported} settings`, 2500, 'success');
+                            const rejected = result.rejected.length ? `; skipped ${result.rejected.length}` : '';
+                            if (result.rejected.length) ErrorLogModule._add('warn', 'configImport', result.rejected.join(', '));
+                            showToast(`Imported ${imported} settings${rejected}`, 3000, result.rejected.length ? 'warn' : 'success');
                             setTimeout(() => location.reload(), 1000);
                         } catch (err) { showToast('Invalid config file: ' + err.message, 3000, 'error'); }
                     };
@@ -3063,13 +3649,24 @@
             EventBus.on('conversationSearch:updated', () => this._renderConversationSearch(searchInput.value));
             EventBus.on('conversationSearch:loading', (loading) => this._setSearchLoading(loading));
             EventBus.on('voice:status', (status) => this._updateVoiceStatus(status));
+            EventBus.on('diagnostics:updated', () => this._renderDiagnostics());
             EventBus.on('setting:panelPinned', () => this._applyPanelChrome());
             EventBus.on('setting:panelWidth', () => this._applyPanelChrome());
+
+            $(`#${PREFIX}-diagnostics-refresh`).addEventListener('click', async (event) => {
+                const button = event.currentTarget;
+                button.disabled = true;
+                button.textContent = 'Checking';
+                await DiagnosticsModule.collect(true);
+                button.disabled = false;
+                button.textContent = 'Refresh';
+            });
 
             this._renderPrompts();
             this._renderUsage(this._usageData);
             this._renderConversationSearch('');
             this._renderErrorLog();
+            this._renderDiagnostics();
             this._updateTurnNav();
         },
 
@@ -3136,6 +3733,20 @@
                 this._claudeSettings = settings;
                 this._renderFeatures(settings);
             }
+            await DiagnosticsModule.collect(false);
+        },
+
+        _renderDiagnostics() {
+            const container = $(`#${PREFIX}-diagnostics-content`);
+            if (!container) return;
+            const summary = DiagnosticsModule.getSummary();
+            if (!summary.checks.length) {
+                setHTML(container, '<span style="color:#555;font-size:10px">Not checked</span>');
+                return;
+            }
+            const colors = { pass: '#3fb950', fail: '#f85149', unknown: '#d29922' };
+            setHTML(container, summary.checks.map(check => `<div style="display:flex;justify-content:space-between;gap:6px;font-size:9px;padding:1px 0"><span>${esc(check.label)}</span><span style="color:${colors[check.state] || colors.unknown}" title="${esc(check.detail)}">${check.state.toUpperCase()}</span></div>`).join('') +
+                `<div style="font-size:8px;color:#555;margin-top:3px">Last checked: ${esc(summary.lastRun ? new Date(summary.lastRun).toLocaleTimeString() : 'never')}</div>`);
         },
 
         _renderUsage(data) {
@@ -3590,7 +4201,7 @@
         ThemeModule, FocusModule, DensityModule, LayoutModule, VisualModule, PasteFixModule,
         AutoScrollModule, AutoApproveModule, UsageTrackerModule, ContextModule, CacheModule, CostModule,
         ResponseModule, DomTrimmerModule, CodeFoldModule, CopyTurnModule,
-        ErrorLogModule, RetitleModule, ConversationSearchModule, VoiceDictationModule,
+        ErrorLogModule, DiagnosticsModule, RetitleModule, ConversationSearchModule, VoiceDictationModule,
         ForkConversationModule, SnippetModule, PromptModule, PanelToolsModule
     ];
 
@@ -3613,6 +4224,7 @@
 
         // Error log must init first to capture other module errors
         safeInit(ErrorLogModule);
+        safeInit(DiagnosticsModule);
 
         // Init modules that work at document-start
         safeInit(ThemeModule);
@@ -3671,6 +4283,17 @@
         }, 2000);
 
         console.log(`%c${LOG_TAG} Ready! Hover right edge to open the panel`, 'color:#3fb950;font-weight:bold');
+    }
+
+    // Small, opt-in seam for the local Node smoke/contract tests. It is never
+    // populated for normal userscript execution and carries no page data.
+    if (window.__CUE_TEST__) {
+        window.__CUE_TEST_API = {
+            VERSION, PREFIX, Settings, ConfigCodec, StorageRepository,
+            ConversationSerializer, ClaudeAPI, StreamMonitor, DiagnosticsModule,
+            EventBus, sanitizeMarkup, getConversationMessages, getSafeElementHTML
+        };
+        return;
     }
 
     // Start

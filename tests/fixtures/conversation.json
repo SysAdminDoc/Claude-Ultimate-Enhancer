@@ -1,0 +1,31 @@
+{
+  "uuid": "conversation-1",
+  "name": "Branch fixture",
+  "created_at": "2026-08-11T12:00:00.000Z",
+  "updated_at": "2026-08-11T12:03:00.000Z",
+  "model": "claude-test",
+  "current_message_uuid": "assistant-branch",
+  "chat_messages": [
+    {
+      "uuid": "human-root",
+      "sender": "human",
+      "text": "Start",
+      "content": [{"type": "text", "text": "Start"}]
+    },
+    {
+      "uuid": "assistant-main",
+      "parent_message_uuid": "human-root",
+      "sender": "assistant",
+      "content": [{"type": "text", "text": "Main answer"}],
+      "unknown_future_block": {"kept": true}
+    },
+    {
+      "uuid": "assistant-branch",
+      "parent_message_uuid": "human-root",
+      "sender": "assistant",
+      "content": [{"type": "text", "text": "Branch answer"}],
+      "artifacts": [{"id": "artifact-1", "type": "text", "content": "local artifact"}],
+      "truncated": true
+    }
+  ]
+}

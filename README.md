@@ -30,8 +30,9 @@ All-in-one Claude.ai enhancement suite — theme engine, usage monitor, conversa
 - **Voice Dictation** — Insert speech-to-text into the composer through the browser Web Speech API
 - **Focus Mode** — Hide the Claude sidebar for deep-work sessions
 - **Turn Navigator** — Jump between user/assistant turns from the side panel
-- **Conversation Export** — Exports the current chat to Markdown, JSON, or HTML from the panel
-- **Config Import/Export** — Export all settings + prompts as JSON, import on another machine
+- **Conversation Export** — Exports the current chat to branch-aware Markdown, JSON, or self-contained HTML from the panel; uses Claude metadata when available and reports DOM-fallback limitations
+- **Config Import/Export** — Versioned settings + prompts JSON with size/type validation, safe partial imports, and migration-friendly envelopes
+- **Diagnostics** — Panel checks for editor/selectors, message groups, organization/API status, fetch interception, and SSE health
 - **Native Feature Toggles** — Flip Claude's own features (Code Execution / Repl Tool / Memory / Search / Projects) without leaving the panel
 - **Error Log** — See which modules encountered errors on the current page (toggle via panel)
 - **Graceful Degradation** — Each module initializes independently; one failure never takes down the rest
@@ -46,6 +47,16 @@ All-in-one Claude.ai enhancement suite — theme engine, usage monitor, conversa
 3. Visit [claude.ai](https://claude.ai) — the panel is hidden by default; hover the right edge to open it
 
 Updates roll out automatically because the metadata block declares `@updateURL` and `@downloadURL` pointing at this repo's `main` branch.
+
+## Verification
+
+The repository includes dependency-free Node contract tests for metadata, storage migration, config validation, sanitizer behavior, API status handling, and branch-aware serialization:
+
+```text
+npm test
+```
+
+All tracked userscripts should also pass `node --check`. The active script is scoped to the top-level Claude document and stores structured local data through bounded versioned records. Conversation content is not uploaded by CUE, but browser/userscript storage is not encrypted; use the panel's clear-data controls and exported backups deliberately.
 
 ## License
 
